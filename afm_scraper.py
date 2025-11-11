@@ -1,3 +1,5 @@
+# afm_scraper.py
+
 import csv
 import io
 import logging
@@ -14,9 +16,9 @@ AFM_SHORTPOS_URL = "https://www.afm.nl/nl-nl/sector/registers/meldingenregisters
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    logger.addHandler(handler)
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(h)
 logger.setLevel(logging.INFO)
 
 
@@ -38,6 +40,10 @@ class ShortPosition:
 
 # ---------- helpers ----------
 
+ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
+DATE_RE = re.compile(r"(\d{2})[-/](\d{2})[-/](\d{2,4})|(\d{4})[-/](\d{2})[-/](\d{2})")
+PERCENT_RE = re.compile(r"\d[\d\.,]*\s*%")
+
 def _clean(x: str) -> str:
     return re.sub(r"\s+", " ", (x or "").strip())
 
@@ -46,7 +52,14 @@ def _pct_to_float(p: str) -> float:
         return 0.0
     s = str(p).replace("%", "").replace(",", ".").strip()
     m = re.search(r"(\d+(?:\.\d+)?)", s)
-    return float(m.group(1)) if m else 0.0
+    try:
+        v = float(m.group(1)) if m else 0.0
+        # guard rails — short positions are within 0..50 typically
+        if v < 0 or v > 100:
+            return 0.0
+        return v
+    except Exception:
+        return 0.0
 
 def _parse_date(d: str) -> Tuple[str, str]:
     raw = _clean(d)
@@ -55,12 +68,12 @@ def _parse_date(d: str) -> Tuple[str, str]:
             return raw, datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
         except ValueError:
             pass
-    m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", raw)
+    m = DATE_RE.search(raw)
     if m:
-        return raw, f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-    m = re.search(r"(\d{4})[-/](\d{2})[-/](\d{2})", raw)
-    if m:
-        return raw, f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        if m.group(1):  # dd-mm-yyyy
+            return raw, f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+        else:           # yyyy-mm-dd
+            return raw, f"{m.group(4)}-{m.group(5)}-{m.group(6)}"
     return raw, raw
 
 def _uid(issuer: str, short_seller: str, iso_date: str, pct: str) -> str:
@@ -78,21 +91,25 @@ def _decode_best(content: bytes) -> str:
             continue
     return content.decode("utf-8", errors="ignore")
 
+def _sniff_delimiter(text: str) -> str:
+    try:
+        return csv.Sniffer().sniff(text[:4096], delimiters=";,\t").delimiter
+    except Exception:
+        return ";"
 
-# ---------- CSV export discovery & parsing ----------
+
+# ---------- discover CSV link ----------
 
 def _find_csv_url() -> Optional[str]:
-    """Fetch the page and locate the CSV export link (GUID is allowed to change)."""
     logger.info("Fetching AFM page: %s", AFM_SHORTPOS_URL)
     r = requests.get(
         AFM_SHORTPOS_URL,
         timeout=30,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; PennywatchScraper/1.0)"}
+        headers={"User-Agent": "Mozilla/5.0 (compatible; PennywatchScraper/1.0)"},
     )
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Prefer explicit CSV links
     for a in soup.find_all("a", href=True):
         href = a["href"]
         label = _clean(a.get_text()).lower()
@@ -101,7 +118,6 @@ def _find_csv_url() -> Optional[str]:
             logger.info("Found CSV link: %s", url)
             return url
 
-    # Fallback: AFM frequently uses export.aspx?type=<GUID>&format=csv
     for a in soup.find_all("a", href=True):
         href = a["href"].lower()
         if "export.aspx" in href and "format=csv" in href:
@@ -113,61 +129,92 @@ def _find_csv_url() -> Optional[str]:
     return None
 
 
-def _sniff_delimiter(text: str) -> str:
-    try:
-        dialect = csv.Sniffer().sniff(text[:4096], delimiters=";,\t")
-        return dialect.delimiter
-    except Exception:
-        # AFM exports are very often semicolon-separated
-        return ";"
+# ---------- header-agnostic CSV parsing ----------
 
+def _score_name_like(text: str) -> float:
+    """
+    Heuristic score for 'name-looking' strings (issuer/short-seller):
+    - prefers alphabetic & spaces
+    - penalizes digits/pure codes
+    """
+    t = _clean(text)
+    if not t:
+        return 0.0
+    letters = sum(c.isalpha() for c in t)
+    spaces  = t.count(" ")
+    digits  = sum(c.isdigit() for c in t)
+    # short sellers/issuers are mostly letters + spaces, few digits
+    return letters + 0.5 * spaces - 1.5 * digits
 
-def _map_get(row: Dict[str, str], keys: List[str]) -> str:
-    # case-insensitive get with synonyms
-    if not row:
-        return ""
-    for k in keys:
-        if k in row and row[k]:
-            return _clean(row[k])
-    lower = {k.lower(): v for k, v in row.items()}
-    for k in keys:
-        lk = k.lower()
-        if lk in lower and lower[lk]:
-            return _clean(lower[lk])
-    return ""
+def _pick_columns_by_values(row: Dict[str, str]) -> Tuple[str, str, str, str, Optional[str]]:
+    """
+    From a CSV row (dict), extract: issuer, holder, pct_raw, date_raw, isin
+    purely by inspecting cell values + weak header hints.
+    """
+    cells = [(k, _clean(v or "")) for k, v in row.items()]
+    if not cells:
+        return "", "", "", "", None
 
+    # Detect candidates
+    pct_candidates  = []
+    date_candidates = []
+    isin_candidates = []
+    name_candidates = []
+
+    for idx, (k, v) in enumerate(cells):
+        if not v:
+            continue
+        # percentage: explicit '%' or a numeric within 0..50 (commas allowed)
+        if PERCENT_RE.search(v):
+            pct_candidates.append((idx, v))
+        else:
+            m = re.search(r"(\d+(?:[.,]\d+)?)", v)
+            if m:
+                try:
+                    val = float(m.group(1).replace(",", "."))
+                    if 0.0 < val <= 50.0:
+                        pct_candidates.append((idx, v))
+                except Exception:
+                    pass
+
+        if DATE_RE.search(v):
+            date_candidates.append((idx, v))
+
+        if ISIN_RE.match(v):
+            isin_candidates.append((idx, v))
+
+        name_candidates.append((idx, v, _score_name_like(v)))
+
+    # choose the first/best matches
+    pct_idx, pct_raw = (pct_candidates[0] if pct_candidates else (None, ""))
+    date_idx, date_raw = (date_candidates[0] if date_candidates else (None, ""))
+
+    isin = isin_candidates[0][1] if isin_candidates else None
+
+    # Remove used indices from name pool
+    used = {i for i in (pct_idx, date_idx) if i is not None}
+    if isin_candidates:
+        used.add(isin_candidates[0][0])
+
+    names = [(i, v, s) for (i, v, s) in name_candidates if i not in used and v]
+    # prefer higher score, but keep original order among the top 2 for stability
+    names.sort(key=lambda t: (-t[2], t[0]))
+    issuer = names[0][1] if len(names) >= 1 else ""
+    holder = names[1][1] if len(names) >= 2 else ""
+
+    return issuer, holder, pct_raw, date_raw, isin
 
 def _parse_csv_rows(text: str) -> List[ShortPosition]:
     delim = _sniff_delimiter(text)
     reader = csv.DictReader(io.StringIO(text), delimiter=delim)
 
-    SYM_ISSUER  = ["Uitgevende instelling", "Issuer", "Uitgevende"]
-    SYM_ISIN    = ["ISIN"]
-    SYM_HOLDER  = ["Partij", "Houder", "Short seller", "Meldingsplichtige"]
-    SYM_PCT     = ["Netto shortpositie", "Net short position", "Netto-shortpositie", "%", "Net short %"]
-    SYM_DATE    = ["Datum", "Date", "Datum melding", "Meldingsdatum"]
-
     out: List[ShortPosition] = []
     seen = 0
+
     for row in reader:
         seen += 1
-        issuer = _map_get(row, SYM_ISSUER)
-        issuer_isin = _map_get(row, SYM_ISIN) or None
-        holder = _map_get(row, SYM_HOLDER)
-        pct_raw = _map_get(row, SYM_PCT)
-        date_raw = _map_get(row, SYM_DATE)
 
-        # Heuristics in case headers vary further
-        if not pct_raw:
-            for v in row.values():
-                if v and re.search(r"\d[\d\.,]*\s*%", str(v)):
-                    pct_raw = _clean(v)
-                    break
-        if not date_raw:
-            for v in row.values():
-                if v and re.search(r"\d{2}[-/]\d{2}[-/]\d{2,4}|\d{4}[-/]\d{2}[-/]\d{2}", str(v)):
-                    date_raw = _clean(v)
-                    break
+        issuer, holder, pct_raw, date_raw, isin = _pick_columns_by_values(row)
 
         if not issuer or not holder or not pct_raw:
             continue
@@ -179,7 +226,7 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
         out.append(
             ShortPosition(
                 issuer=issuer,
-                issuer_isin=issuer_isin,
+                issuer_isin=isin,
                 short_seller=holder,
                 net_short_pct=pct_raw,
                 net_short_pct_num=pct_num,
@@ -202,7 +249,11 @@ def scrape_short_positions() -> List[ShortPosition]:
         logger.warning("AFM short positions: found 0 items (no CSV link).")
         return []
 
-    resp = requests.get(csv_url, timeout=30, headers={"User-Agent": "Mozilla/5.0 (compatible; PennywatchScraper/1.0)"})
+    resp = requests.get(
+        csv_url,
+        timeout=30,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; PennywatchScraper/1.0)"},
+    )
     resp.raise_for_status()
     text = _decode_best(resp.content)
 
@@ -212,11 +263,10 @@ def scrape_short_positions() -> List[ShortPosition]:
     return items
 
 
-# ---------- compatibility API for your main.py ----------
+# ---------- compatibility for your main.py ----------
 
 def fetch_items() -> List[Dict]:
     return [sp.to_dict() for sp in scrape_short_positions()]
 
 def fetch_afm_table() -> List[Dict]:
-    """Backward-compatible alias used by existing main.py."""
     return fetch_items()
