@@ -1,85 +1,50 @@
-# --- company_filter_pennywatch.py ---
-import difflib
-import re
-import logging
+"""
+Filtering for Pennywatch content.
 
-APPROVED_COMPANIES = [
-    "Koninklijke BAM Groep N.V.",
-    "Koninklijke Heijmans N.V.",
-    "Wereldhave N.V.",
-    "Pharming Group N.V.",
-    "Acomo N.V.",
-    "Nedap N.V.",
-    "TomTom N.V.",
-    "B&S Group S.A.",
-    "PostNL N.V.",
-    "Fastned B.V.",
-    "Sligro Food Group N.V.",
-    "Brunel International N.V.",
-    "NSI N.V.",
-    "ForFarmers N.V.",
-    "Kendrion N.V.",
-    "Sif Holding N.V.",
-    "Accsys Technologies PLC",
-    "NX Filtration N.V.",
-    "Azerion Group N.V.",
-    "CM.com N.V.",
-    "Avantium N.V.",
-    "Vivoryon Therapeutics N.V.",
-    "Ebusco Holding N.V.",
-    "Tetragon Financial Group Limited",
-    "Retail Estates N.V.",
-    "Envipco Holding N.V.",
-    "Volta Finance Limited",
-    "Hydratec Industries N.V.",
-    "MotorK PLC",
-    "AFC Ajax N.V.",
-    "SPEAR Investments I B.V.",
-    "The London Tunnels PLC",
-    "Holland Colours N.V.",
-    "Value8 N.V.",
-    "Bever Holding N.V.",
-    "Cabka N.V.",
-    "Morefield Group N.V.",
-    "Ctac N.V.",
-    "New Amsterdam Invest N.V.",
-    "Alumexx N.V.",
-    "MKB Nedsense N.V.",
-    "PB Holding N.V.",
-    "Eurocastle Investment Limited",
-    "Ease2pay N.V.",
-    "B.V. Delftsch Aardewerkfabriek “De Porceleyne Fles Anno 1653”",
-    "Green Earth Group N.V.",
-    "Lavide Holding N.V.",
-    "New Sources Energy N.V.",
-    "Titan N.V.",
-    "Almunda Professionals N.V.",
-    "Agility Capital Holding Inc."
-]
+For SHORT POSITIONS we want to publish broadly. Therefore, the default here is:
+- Allow everything (return True).
+- Optional deny/allow lists can be applied via environment variables.
 
-def normalize_name(name: str) -> str:
-    """Clean and standardize company names for comparison."""
-    if not name:
-        return ""
-    name = name.lower()
-    # Remove punctuation and known suffixes
-    name = re.sub(r'[^a-z0-9& ]', '', name)
-    name = re.sub(r'\b(nv|bv|sa|plc|inc|group|holding|limited|nederland|the|royal)\b', '', name)
-    name = re.sub(r'\s+', ' ', name).strip()
-    return name
+Env:
+  SHORTPOS_USE_FILTER   -> "1" to enable basic filtering (default: "0" = disabled)
+  SHORTPOS_ALLOW_ISINS  -> comma-separated ISINs to allow (case-insensitive)
+  SHORTPOS_ALLOW_ISSUERS-> comma-separated issuer name fragments to allow (lowercased match)
+  SHORTPOS_DENY_ISSUERS -> comma-separated issuer name fragments to block (lowercased match)
+"""
 
-def is_approved_company(name: str) -> bool:
-    """Return True if company name matches (fuzzy or partial) with approved list."""
-    if not name:
-        return False
-    name_clean = normalize_name(name)
-    for company in APPROVED_COMPANIES:
-        comp_clean = normalize_name(company)
-        # Direct or partial match
-        if name_clean in comp_clean or comp_clean in name_clean:
-            return True
-        # Fuzzy similarity match
-        ratio = difflib.SequenceMatcher(None, name_clean, comp_clean).ratio()
-        if ratio > 0.8:
-            return True
-    return False
+import os
+
+USE_FILTER = os.getenv("SHORTPOS_USE_FILTER", "0").strip().lower() in {"1", "true", "yes"}
+
+def _csv_set(env_key: str):
+    raw = os.getenv(env_key, "")
+    vals = [v.strip() for v in raw.split(",") if v.strip()]
+    return set(vals)
+
+ALLOW_ISINS      = {v.upper() for v in _csv_set("SHORTPOS_ALLOW_ISINS")}
+ALLOW_ISSUERS    = {v.lower() for v in _csv_set("SHORTPOS_ALLOW_ISSUERS")}
+DENY_ISSUERS     = {v.lower() for v in _csv_set("SHORTPOS_DENY_ISSUERS")}
+
+def _match_fragment(hay: str, needles: set[str]) -> bool:
+    h = (hay or "").lower()
+    return any(n in h for n in needles)
+
+def is_approved_company(issuer_name: str | None, issuer_isin: str | None = None) -> bool:
+    """
+    Default: allow all (so short positions aren’t accidentally suppressed).
+    If SHORTPOS_USE_FILTER=1, apply simple allow/deny lists.
+    """
+    if not USE_FILTER:
+        return True
+
+    name_ok = True
+    if DENY_ISSUERS and _match_fragment(issuer_name or "", DENY_ISSUERS):
+        name_ok = False
+    if ALLOW_ISSUERS:
+        name_ok = name_ok and _match_fragment(issuer_name or "", ALLOW_ISSUERS)
+
+    isin_ok = True
+    if ALLOW_ISINS:
+        isin_ok = (issuer_isin or "").upper() in ALLOW_ISINS
+
+    return bool(name_ok and isin_ok)
