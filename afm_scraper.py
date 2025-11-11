@@ -1,274 +1,230 @@
-from company_filter_pennywatch import is_approved_company
-import re
 import hashlib
-import time
 import logging
-from typing import Tuple, Optional, List, Dict
-from urllib.parse import urljoin
+import re
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Dict, Iterable, List, Optional
+
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
-from config import AFM_URL
+from company_filter_pennywatch import is_approved_company
 
-BASE = "https://www.afm.nl"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-TIMEOUT = 25
-RETRIES = 2
+AFM_SHORTPOS_URL = (
+    "https://www.afm.nl/nl-nl/sector/registers/meldingenregisters/netto-shortposities-actueel"
+)
 
-# ---------- helpers ----------
+# Make logging consistent with the rest of the project
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-def _norm_text(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-def _norm_pct(s: Optional[str]) -> Optional[str]:
-    if not s:
-        return None
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*%?", str(s))
-    if not m:
-        return None
+@dataclass
+class ShortPosition:
+    """A single *current* net short position row from AFM."""
+    issuer: str                      # Uitgevende instelling
+    issuer_isin: Optional[str]       # (if present on the page; often shown)
+    short_seller: str                # Partij die short gaat
+    net_short_pct: str               # e.g. "0,60%" (we keep raw string; also store numeric)
+    net_short_pct_num: float         # e.g. 0.60
+    position_date: str               # e.g. "22-10-2024" (raw)
+    position_date_iso: str           # e.g. "2024-10-22"
+    source_url: str                  # the page we scraped
+    unique_id: str                   # stable UID over issuer+shorter+date+percentage
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+def _clean_text(x: str) -> str:
+    return re.sub(r"\s+", " ", (x or "").strip())
+
+
+def _pct_to_float(p: str) -> float:
+    """
+    Convert a percent string like '0,60%' or '1.25%' to float (0.60 or 1.25).
+    """
+    if not p:
+        return 0.0
+    s = p.replace("%", "").replace(",", ".").strip()
     try:
-        return f"{float(m.group(1).replace(',', '.')):.2f}%"
-    except Exception:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _parse_date(d: str) -> (str, str):
+    """
+    Accepts formats like '22-10-2024' or '2024-10-22' and returns:
+      (raw_input, iso_yyyy_mm_dd)
+    """
+    raw = _clean_text(d)
+    for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            iso = datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+            return raw, iso
+        except ValueError:
+            continue
+    # Fallback: try to extract digits
+    m = re.search(r"(\d{4})[-/](\d{2})[-/](\d{2})", raw)
+    if m:
+        iso = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        return raw, iso
+    return raw, raw  # last resort
+
+
+def _make_uid(issuer: str, short_seller: str, iso_date: str, pct: str) -> str:
+    base = f"{issuer}|{short_seller}|{iso_date}|{pct}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+
+
+def _find_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
+    """
+    AFM uses a standard 'data-table' for registers. We try a few strategies:
+    - <table> with headers that include 'Netto shortpositie'
+    - First table on the page if headers match common set
+    """
+    tables = soup.find_all("table")
+    if not tables:
         return None
 
-def _request(url: str) -> requests.Response:
-    last_exc = None
-    for i in range(RETRIES):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-            if r.status_code == 403:
-                time.sleep(0.7)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last_exc = e
-            time.sleep(0.7)
-    raise last_exc
+    def headers_of(tbl: BeautifulSoup) -> List[str]:
+        heads = []
+        thead = tbl.find("thead")
+        if thead:
+            for th in thead.find_all("th"):
+                heads.append(_clean_text(th.get_text()))
+        else:
+            # sometimes headers are the first row in <tbody>
+            first_row = tbl.find("tr")
+            if first_row:
+                for th in first_row.find_all(["th", "td"]):
+                    heads.append(_clean_text(th.get_text()))
+        return [h.lower() for h in heads]
 
-# ---------- detail parsing ----------
+    for t in tables:
+        lower_heads = headers_of(t)
+        if any("netto" in h and "short" in h for h in lower_heads) or any(
+            "shortpositie" in h for h in lower_heads
+        ):
+            return t
+    # fallback: just return the first one
+    return tables[0]
 
-LABEL_PAT_KAP = re.compile(r"\bkapitaalbelang\b|\bkapitaal\b|\bcapital\b", re.I)
-LABEL_PAT_STEM = re.compile(r"\bstemrecht\b|\bstemrechten\b|\bvoting\b", re.I)
 
-HEADER_PAT_TOTAL = re.compile(r"\btotale? deelneming\b|\btotal holding\b", re.I)
-HEADER_PAT_PREV  = re.compile(r"\bvoorheen\b|\bvorige\b|\bprevious\b", re.I)
-
-def _row_texts(tr: Tag) -> List[str]:
-    return [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
-
-def _extract_from_detail_html(html: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    soup = BeautifulSoup(html, "lxml")
-    kap = stem = prev_kap = prev_stem = None
-
-    for table in soup.find_all("table"):
-        trs = table.find_all("tr")
-        if not trs:
-            continue
-
-        header_cells = None
-        for tr in trs:
-            ths = tr.find_all("th")
-            if ths:
-                header_cells = [th.get_text(" ", strip=True) for th in ths]
-                header_norms = [_norm_text(h) for h in header_cells]
-                break
-        if not header_cells:
-            continue
-
-        total_idx = None
-        prev_idx = None
-        for idx, hn in enumerate(header_norms):
-            if HEADER_PAT_TOTAL.search(hn):
-                total_idx = idx
-            if HEADER_PAT_PREV.search(hn):
-                prev_idx = idx
-
-        if total_idx is None:
-            continue
-
-        for tr in trs:
-            tds = tr.find_all("td")
-            if not tds:
-                continue
-            cells = [td.get_text(" ", strip=True) for td in tds]
-            if not cells:
-                continue
-            label = _norm_text(cells[0])
-
-            if LABEL_PAT_KAP.search(label):
-                if total_idx < len(cells):
-                    kap = _norm_pct(cells[total_idx]) or kap
-                if prev_idx is not None and prev_idx < len(cells):
-                    prev_kap = _norm_pct(cells[prev_idx]) or prev_kap
-
-            if LABEL_PAT_STEM.search(label):
-                if total_idx < len(cells):
-                    stem = _norm_pct(cells[total_idx]) or stem
-                if prev_idx is not None and prev_idx < len(cells):
-                    prev_stem = _norm_pct(cells[prev_idx]) or prev_stem
-
-        if kap or stem:
-            break
-
-    if not kap and not stem:
-        for table in soup.find_all("table"):
-            trs = table.find_all("tr")
-            if not trs:
-                continue
-
-            headers = []
-            for tr in trs:
-                ths = tr.find_all("th")
-                if ths:
-                    headers = [_norm_text(th.get_text(" ", strip=True)) for th in ths]
-                    break
-
-            for tr in trs:
-                cells = _row_texts(tr)
-                if len(cells) < 2:
-                    continue
-                label = _norm_text(cells[0])
-
-                if LABEL_PAT_KAP.search(label):
-                    val = None
-                    if headers:
-                        for idx, h in enumerate(headers):
-                            if HEADER_PAT_TOTAL.search(h) and idx < len(cells):
-                                val = cells[idx]
-                                break
-                    if not val:
-                        for c in cells[1:]:
-                            if _norm_pct(c):
-                                val = c
-                                break
-                    kap = _norm_pct(val) or kap
-
-                if LABEL_PAT_STEM.search(label):
-                    val = None
-                    if headers:
-                        for idx, h in enumerate(headers):
-                            if HEADER_PAT_TOTAL.search(h) and idx < len(cells):
-                                val = cells[idx]
-                                break
-                    if not val:
-                        for c in cells[1:]:
-                            if _norm_pct(c):
-                                val = c
-                                break
-                    stem = _norm_pct(val) or stem
-
-            if kap or stem:
-                break
-
-    if not kap or not stem:
-        full = soup.get_text(" ", strip=True).lower()
-        if not kap:
-            m = re.search(r"(kapitaal\w*|capital\w*|total holding|totale deelneming|belang).{0,24}(\d+(?:[.,]\d+)?)\s*%", full)
-            kap = _norm_pct(m.group(2)) if m else kap
-        if not stem:
-            m = re.search(r"(stemrecht\w*|voting\w*).{0,24}(\d+(?:[.,]\d+)?)\s*%", full)
-            stem = _norm_pct(m.group(2)) if m else stem
-
-    return kap, stem, prev_kap, prev_stem
-
-# ---------- list page ----------
-
-def _collect_detail_links_and_df(list_html: str) -> Tuple[List[Optional[str]], List[Dict[str, str]]]:
-    soup = BeautifulSoup(list_html, "lxml")
-    table = soup.find("table")
-    if not table:
-        return [], []
-
-    detail_hrefs = []
-    for tr in table.find_all("tr"):
-        td = tr.find("td")
-        a = td.find("a", href=True) if td else None
-        detail_hrefs.append(a["href"] if a else None)
-
+def _header_map(table: BeautifulSoup) -> Dict[str, int]:
+    """
+    Build a header index map so we can read by column name regardless of order.
+    We match on Dutch labels typically shown by AFM.
+    """
+    map_idx: Dict[str, int] = {}
+    thead = table.find("thead")
     headers = []
-    for tr in table.find_all("tr"):
-        ths = tr.find_all("th")
-        if ths:
-            headers = [th.get_text(" ", strip=True) for th in ths]
-            break
+    if thead:
+        headers = thead.find_all("th")
+    else:
+        # possibly header-like first row
+        first_tr = table.find("tr")
+        headers = first_tr.find_all(["th", "td"]) if first_tr else []
 
-    rows = []
-    for tr in table.find_all("tr"):
+    for i, th in enumerate(headers):
+        txt = _clean_text(th.get_text()).lower()
+        if any(k in txt for k in ["uitgevende instelling", "issuer", "uitgevende"]):
+            map_idx["issuer"] = i
+        if any(k in txt for k in ["isin"]):
+            map_idx["isin"] = i
+        if any(k in txt for k in ["partij", "short", "meldingsplichtige", "houder"]):
+            map_idx["short_seller"] = i
+        if any(k in txt for k in ["netto short", "netto-short", "shortpositie", "%"]):
+            map_idx["net_short_pct"] = i
+        if any(k in txt for k in ["datum", "date"]):
+            map_idx["date"] = i
+
+    return map_idx
+
+
+def _iter_rows(table: BeautifulSoup) -> Iterable[List[BeautifulSoup]]:
+    tbody = table.find("tbody") or table
+    for tr in tbody.find_all("tr"):
         tds = tr.find_all("td")
+        # Skip header-like rows inside tbody
         if not tds:
             continue
-        cells = [td.get_text(" ", strip=True) for td in tds]
-        row = {}
-        for idx, val in enumerate(cells):
-            key = headers[idx] if idx < len(headers) else f"col_{idx}"
-            row[key] = val
+        yield tds
 
-        emittent = row.get("Uitgevende instelling") or row.get("Issuer") or ""
-        melder   = row.get("Meldingsplichtige") or row.get("Shareholder") or ""
-        datum    = row.get("Datum meldingsplicht") or row.get("Datum melding") or row.get("Date") or ""
-        rows.append({"emittent": emittent.strip(), "melder": melder.strip(), "datum": datum.strip()})
 
-    if len(detail_hrefs) == len(rows) + 1:
-        detail_hrefs = detail_hrefs[1:]
+def scrape_short_positions() -> List[ShortPosition]:
+    """
+    Scrape AFM 'Netto shortposities - actueel' and return a list of ShortPosition.
+    Filters issuers via company_filter_pennywatch.is_approved_company().
+    """
+    logger.info("Fetching AFM short positions: %s", AFM_SHORTPOS_URL)
+    resp = requests.get(
+        AFM_SHORTPOS_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; PennywatchScraper/1.0)",
+            "Accept-Language": "nl,en;q=0.9",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
 
-    return detail_hrefs, rows
-
-# ---------- main scraper ----------
-
-def fetch_afm_table():
-    r = _request(AFM_URL)
-    if r.status_code == 403:
-        print("[AFM] 403 Forbidden op lijstpagina.")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = _find_table(soup)
+    if not table:
+        logger.warning("No table found on AFM short positions page.")
         return []
 
-    detail_hrefs, rows = _collect_detail_links_and_df(r.text)
-    if not rows:
-        print("[AFM] Geen rijen gevonden op de lijstpagina.")
-        return []
+    hmap = _header_map(table)
+    results: List[ShortPosition] = []
 
-    results = []
-    for i, row in enumerate(rows):
-        emittent = row.get("emittent", "")
-        melder   = row.get("melder", "")
-        datum    = row.get("datum", "")
+    for tds in _iter_rows(table):
+        def pick(idx_key: str) -> str:
+            if idx_key not in hmap:
+                return ""
+            i = hmap[idx_key]
+            if i < len(tds):
+                return _clean_text(tds[i].get_text())
+            return ""
 
-        # ✅ Filter by approved companies
-        if not is_approved_company(emittent):
-            logging.info(f"⏭️ Skipped: {emittent} not in approved list.")
+        issuer = pick("issuer")
+        issuer_isin = pick("isin") or None
+        short_seller = pick("short_seller")
+        net_pct_raw = pick("net_short_pct")
+        date_raw = pick("date")
+
+        # basic row validation
+        if not issuer or not short_seller or not net_pct_raw:
             continue
 
-        href = detail_hrefs[i] if i < len(detail_hrefs) else None
-        detail_url = urljoin(BASE, href) if href else None
+        # optional filter by our allowlist
+        if not is_approved_company(issuer, issuer_isin):
+            continue
 
-        kap = stem = prev_kap = prev_stem = None
-        if detail_url:
-            try:
-                rd = _request(detail_url)
-                kap, stem, prev_kap, prev_stem = _extract_from_detail_html(rd.text)
-            except Exception as e:
-                print(f"[AFM] detail fetch/parse failed: {detail_url} ({e})")
+        pct_num = _pct_to_float(net_pct_raw)
+        date_raw, iso = _parse_date(date_raw or "")
 
-        key_src = f"{emittent}|{melder}|{datum}|{kap or ''}|{stem or ''}"
-        afm_key = hashlib.sha1(key_src.encode("utf-8")).hexdigest()
+        uid = _make_uid(issuer, short_seller, iso, net_pct_raw)
 
-        results.append({
-            "afm_key": afm_key,
-            "emittent": emittent,
-            "melder": melder,
-            "meldingsdatum": datum,
-            "kapitaal_pct": kap,
-            "stem_pct": stem,
-            "prev_kapitaal_pct": prev_kap,
-            "prev_stem_pct": prev_stem,
-            "detail_url": detail_url,
-        })
+        results.append(
+            ShortPosition(
+                issuer=issuer,
+                issuer_isin=issuer_isin,
+                short_seller=short_seller,
+                net_short_pct=net_pct_raw,
+                net_short_pct_num=pct_num,
+                position_date=date_raw,
+                position_date_iso=iso,
+                source_url=AFM_SHORTPOS_URL,
+                unique_id=uid,
+            )
+        )
 
+    logger.info("Parsed %d short positions (after filtering).", len(results))
     return results
+
+
+# Backwards-compatible alias if other modules call the old API:
+def fetch_items() -> List[Dict]:
+    """Return list of dicts for compatibility with existing pipeline."""
+    return [sp.to_dict() for sp in scrape_short_positions()]
