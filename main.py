@@ -1,4 +1,4 @@
-import re
+# main.py
 from afm_scraper import fetch_afm_table
 from article_builder import build_article
 from publisher import publish_to_wordpress
@@ -24,7 +24,7 @@ def process_new_entries():
             break
 
         # Publish everything (no skip conditions)
-        article = build_article(record, prev_from_db=None)
+        article = build_article(record)  # ← removed prev_from_db kwarg
         publish_to_wordpress(article)
         posted += 1
 
