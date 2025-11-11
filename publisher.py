@@ -1,5 +1,3 @@
-# publisher.py
-
 import os
 import time
 import logging
@@ -36,61 +34,14 @@ def _posts_url() -> str:
 
 
 def _ensure_list_category(payload: Dict) -> None:
+    # WordPress expects a LIST of IDs.
     if WP_CATEGORY_ID:
         payload["categories"] = [WP_CATEGORY_ID]
 
 
 def _dedupe_key(item: Dict) -> Optional[str]:
+    # Keep the key in meta for later if you want dedupe, but DO NOT skip on it.
     return item.get("afm_key") or item.get("unique_id")
-
-
-def _derive_short_fields(item: Dict) -> Tuple[float, str]:
-    """
-    Detect short-position items and normalize their % fields into the legacy
-    'kapitaalbelang' fields so the old skip logic never fires.
-    """
-    is_short = (
-        item.get("meldingstype") == "shortpositie"
-        or "net_short_pct" in item
-        or "net_short_pct_num" in item
-        or "Netto Shortpositie" in item
-    )
-
-    if is_short:
-        num_val = item.get("net_short_pct_num")
-        if num_val is None:
-            s = str(item.get("net_short_pct") or item.get("Netto Shortpositie") or "").replace("%", "").replace(",", ".")
-            try:
-                num_val = float(s)
-            except Exception:
-                num_val = 0.0
-        pretty = item.get("net_short_pct") or f"{num_val:.2f}%"
-
-        item["kapitaalbelang"] = num_val
-        item["kapitaalbelang_str"] = pretty
-        item["meldingstype"] = "shortpositie"
-        return num_val, pretty
-
-    # Legacy path
-    try:
-        num_val = float(str(item.get("kapitaalbelang", "0")).replace(",", "."))
-    except Exception:
-        num_val = 0.0
-    pretty = item.get("kapitaalbelang_str") or (f"{num_val:.2f}%" if num_val else "n.n.b.")
-    return num_val, pretty
-
-
-def _should_skip(item: Dict) -> Optional[str]:
-    num, pretty = _derive_short_fields(item)
-
-    # Never skip short-positions
-    if item.get("meldingstype") == "shortpositie":
-        return None
-
-    # Legacy skip rule (meldingen only)
-    if not num and (pretty.lower() == "n.n.b." or pretty.strip() in {"", "0", "0%"}):
-        return f"No valid kapitaalbelang (would be n.n.b.) for afm_key={_dedupe_key(item)}"
-    return None
 
 
 def _resolve_tags_to_ids_if_needed(payload: Dict) -> None:
@@ -112,24 +63,23 @@ def _post_to_wordpress(payload: Dict) -> Dict:
 
 
 def publish_items(items: List[Dict]) -> int:
-    """Publish up to MAX_POSTS_PER_RUN items."""
+    """
+    Publish EVERYTHING (no skip conditions), up to MAX_POSTS_PER_RUN.
+    """
     created = 0
 
     for item in items:
         if created >= MAX_POSTS_PER_RUN:
             break
 
-        skip = _should_skip(item)
-        if skip:
-            logger.info("[SKIP] %s", skip)
-            continue
-
+        # Build post payload
         payload = build_article(item, category_id=WP_CATEGORY_ID)
         payload["status"] = WP_PUBLISH_STATUS
 
         _ensure_list_category(payload)
         _resolve_tags_to_ids_if_needed(payload)
 
+        # carry over a stable key if present (but don't use it to skip)
         afm_key = _dedupe_key(item)
         if afm_key:
             payload.setdefault("meta", {})
@@ -138,17 +88,14 @@ def publish_items(items: List[Dict]) -> int:
         try:
             _post_to_wordpress(payload)
             created += 1
-            time.sleep(0.4)
+            time.sleep(0.3)  # be nice to WP
         except Exception as e:
             logger.error("Failed to publish item (afm_key=%s): %s", afm_key, e)
 
+    logger.info("Published %d items.", created)
     return created
 
 
-# ---------- Backward-compat alias for existing main.py ----------
+# ---- Backward-compat alias for main.py ----
 def publish_to_wordpress(items: List[Dict]) -> int:
-    """
-    Old entrypoint name expected by some main.py versions.
-    Delegates to publish_items().
-    """
     return publish_items(items)
