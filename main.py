@@ -13,20 +13,6 @@ def assert_wp_env():
     if missing:
         raise RuntimeError(f"Missing WordPress credentials: {', '.join(missing)}")
 
-def _is_unknown(text: str | None) -> bool:
-    if not text:
-        return True
-    t = text.strip().lower()
-    return t.startswith("onbekende") or t in {"", "n.n.b.", "onbekend"}
-
-_pct_re = re.compile(r"\d+(?:[.,]\d+)?%")
-
-def _has_valid_pct(s: str | None) -> bool:
-    """True als er een echt percentage in staat, anders False (n.n.b., leeg, etc.)."""
-    if not s:
-        return False
-    return bool(_pct_re.search(str(s)))
-
 def process_new_entries():
     assert_wp_env()
 
@@ -37,23 +23,7 @@ def process_new_entries():
         if posted >= MAX_POSTS_PER_RUN:
             break
 
-        # 1) Skip onbekende melder/emittent
-        if _is_unknown(record.get("melder")) or _is_unknown(record.get("emittent")):
-            print(f"[SKIP] Unknown melder/emittent for afm_key={record.get('afm_key')}")
-            continue
-
-        # 2) Skip als kapitaalbelang niet bekend/valide is -> anders komt er 'n.n.b.' in de titel/tekst
-        kap = record.get("kapitaal_pct")
-        if not _has_valid_pct(kap):
-            print(f"[SKIP] No valid kapitaalbelang (would be n.n.b.) for afm_key={record.get('afm_key')}")
-            continue
-
-        # (Optioneel) óók stemrechten verplichten:
-        # stem = record.get("stem_pct")
-        # if not _has_valid_pct(stem):
-        #     print(f"[SKIP] No valid stemrechten (would be n.n.b.) for afm_key={record.get('afm_key')}")
-        #     continue
-
+        # Publish everything (no skip conditions)
         article = build_article(record, prev_from_db=None)
         publish_to_wordpress(article)
         posted += 1
