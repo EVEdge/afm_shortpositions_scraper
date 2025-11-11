@@ -1,5 +1,3 @@
-# afm_scraper.py
-
 import csv
 import io
 import logging
@@ -35,45 +33,42 @@ class ShortPosition:
     unique_id: str
 
     def to_dict(self) -> Dict:
-        return asdict(self)
+        d = asdict(self)
+        # --- Backward-compat aliases for the old pipeline ---
+        d["melder"] = self.short_seller      # old “meldingen” field
+        d["emittent"] = self.issuer          # old “meldingen” field
+        d["afm_key"] = self.unique_id        # stable key for DB/dedupe
+        return d
 
 
 # ---------- helpers ----------
 
-ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
-DATE_RE = re.compile(r"(\d{2})[-/](\d{2})[-/](\d{2,4})|(\d{4})[-/](\d{2})[-/](\d{2})")
-PERCENT_RE = re.compile(r"\d[\d\.,]*\s*%")
+DATE_RE = re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})|(\d{2})[-/](\d{2})[-/](\d{4})")
 
 def _clean(x: str) -> str:
     return re.sub(r"\s+", " ", (x or "").strip())
 
 def _pct_to_float(p: str) -> float:
+    """Accept '0,60', '0.60', '0,60%' etc.; CSV here has no % sign."""
     if p is None:
         return 0.0
     s = str(p).replace("%", "").replace(",", ".").strip()
     m = re.search(r"(\d+(?:\.\d+)?)", s)
-    try:
-        v = float(m.group(1)) if m else 0.0
-        # guard rails — short positions are within 0..50 typically
-        if v < 0 or v > 100:
-            return 0.0
-        return v
-    except Exception:
-        return 0.0
+    return float(m.group(1)) if m else 0.0
 
 def _parse_date(d: str) -> Tuple[str, str]:
     raw = _clean(d)
-    for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
             return raw, datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
         except ValueError:
             pass
     m = DATE_RE.search(raw)
     if m:
-        if m.group(1):  # dd-mm-yyyy
-            return raw, f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-        else:           # yyyy-mm-dd
-            return raw, f"{m.group(4)}-{m.group(5)}-{m.group(6)}"
+        if m.group(1):  # yyyy-mm-dd
+            return raw, f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        else:           # dd-mm-yyyy
+            return raw, f"{m.group(6)}-{m.group(5)}-{m.group(4)}"
     return raw, raw
 
 def _uid(issuer: str, short_seller: str, iso_date: str, pct: str) -> str:
@@ -129,80 +124,14 @@ def _find_csv_url() -> Optional[str]:
     return None
 
 
-# ---------- header-agnostic CSV parsing ----------
+# ---------- CSV parsing for current AFM headers ----------
 
-def _score_name_like(text: str) -> float:
-    """
-    Heuristic score for 'name-looking' strings (issuer/short-seller):
-    - prefers alphabetic & spaces
-    - penalizes digits/pure codes
-    """
-    t = _clean(text)
-    if not t:
-        return 0.0
-    letters = sum(c.isalpha() for c in t)
-    spaces  = t.count(" ")
-    digits  = sum(c.isdigit() for c in t)
-    # short sellers/issuers are mostly letters + spaces, few digits
-    return letters + 0.5 * spaces - 1.5 * digits
-
-def _pick_columns_by_values(row: Dict[str, str]) -> Tuple[str, str, str, str, Optional[str]]:
-    """
-    From a CSV row (dict), extract: issuer, holder, pct_raw, date_raw, isin
-    purely by inspecting cell values + weak header hints.
-    """
-    cells = [(k, _clean(v or "")) for k, v in row.items()]
-    if not cells:
-        return "", "", "", "", None
-
-    # Detect candidates
-    pct_candidates  = []
-    date_candidates = []
-    isin_candidates = []
-    name_candidates = []
-
-    for idx, (k, v) in enumerate(cells):
-        if not v:
-            continue
-        # percentage: explicit '%' or a numeric within 0..50 (commas allowed)
-        if PERCENT_RE.search(v):
-            pct_candidates.append((idx, v))
-        else:
-            m = re.search(r"(\d+(?:[.,]\d+)?)", v)
-            if m:
-                try:
-                    val = float(m.group(1).replace(",", "."))
-                    if 0.0 < val <= 50.0:
-                        pct_candidates.append((idx, v))
-                except Exception:
-                    pass
-
-        if DATE_RE.search(v):
-            date_candidates.append((idx, v))
-
-        if ISIN_RE.match(v):
-            isin_candidates.append((idx, v))
-
-        name_candidates.append((idx, v, _score_name_like(v)))
-
-    # choose the first/best matches
-    pct_idx, pct_raw = (pct_candidates[0] if pct_candidates else (None, ""))
-    date_idx, date_raw = (date_candidates[0] if date_candidates else (None, ""))
-
-    isin = isin_candidates[0][1] if isin_candidates else None
-
-    # Remove used indices from name pool
-    used = {i for i in (pct_idx, date_idx) if i is not None}
-    if isin_candidates:
-        used.add(isin_candidates[0][0])
-
-    names = [(i, v, s) for (i, v, s) in name_candidates if i not in used and v]
-    # prefer higher score, but keep original order among the top 2 for stability
-    names.sort(key=lambda t: (-t[2], t[0]))
-    issuer = names[0][1] if len(names) >= 1 else ""
-    holder = names[1][1] if len(names) >= 2 else ""
-
-    return issuer, holder, pct_raw, date_raw, isin
+# Exact Dutch headers observed in your file:
+COL_HOLDER = "Positie houder"
+COL_ISSUER = "Naam van de emittent"
+COL_ISIN   = "ISIN"
+COL_PCT    = "Netto Shortpositie"      # numeric, no % sign
+COL_DATE   = "Positiedatum"            # e.g. 2025-11-07 00:00:00
 
 def _parse_csv_rows(text: str) -> List[ShortPosition]:
     delim = _sniff_delimiter(text)
@@ -213,14 +142,17 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
 
     for row in reader:
         seen += 1
-
-        issuer, holder, pct_raw, date_raw, isin = _pick_columns_by_values(row)
+        issuer = _clean(row.get(COL_ISSUER, ""))
+        holder = _clean(row.get(COL_HOLDER, ""))
+        isin   = _clean(row.get(COL_ISIN, "")) or None
+        pct_raw = _clean(str(row.get(COL_PCT, "")))
+        date_raw = _clean(str(row.get(COL_DATE, "")))
 
         if not issuer or not holder or not pct_raw:
             continue
 
         pct_num = _pct_to_float(pct_raw)
-        date_raw, iso = _parse_date(date_raw or "")
+        date_raw, iso = _parse_date(date_raw)
         uid = _uid(issuer, holder, iso, pct_raw)
 
         out.append(
@@ -228,7 +160,7 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
                 issuer=issuer,
                 issuer_isin=isin,
                 short_seller=holder,
-                net_short_pct=pct_raw,
+                net_short_pct=pct_raw if "%" in pct_raw else f"{pct_raw}%",  # cosmetic
                 net_short_pct_num=pct_num,
                 position_date=date_raw,
                 position_date_iso=iso,
