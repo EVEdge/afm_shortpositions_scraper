@@ -1,3 +1,5 @@
+# afm_scraper.py
+
 import csv
 import io
 import logging
@@ -34,10 +36,15 @@ class ShortPosition:
 
     def to_dict(self) -> Dict:
         d = asdict(self)
-        # --- Backward-compat aliases for the old pipeline ---
-        d["melder"] = self.short_seller      # old “meldingen” field
-        d["emittent"] = self.issuer          # old “meldingen” field
-        d["afm_key"] = self.unique_id        # stable key for DB/dedupe
+        # ---- Backward-compat for the old "meldingen" pipeline ----
+        d["melder"] = self.short_seller           # old field name for holder
+        d["emittent"] = self.issuer               # old field name for issuer
+        d["afm_key"] = self.unique_id             # stable key for DB/dedupe
+        # These two fields prevent "n.n.b." skip logic:
+        d["kapitaalbelang"] = self.net_short_pct_num              # numeric %
+        d["kapitaalbelang_str"] = self.net_short_pct or f"{self.net_short_pct_num:.2f}%"
+        # Optional: type tag if you branch on it somewhere
+        d["meldingstype"] = "shortpositie"
         return d
 
 
@@ -49,7 +56,6 @@ def _clean(x: str) -> str:
     return re.sub(r"\s+", " ", (x or "").strip())
 
 def _pct_to_float(p: str) -> float:
-    """Accept '0,60', '0.60', '0,60%' etc.; CSV here has no % sign."""
     if p is None:
         return 0.0
     s = str(p).replace("%", "").replace(",", ".").strip()
@@ -124,9 +130,8 @@ def _find_csv_url() -> Optional[str]:
     return None
 
 
-# ---------- CSV parsing for current AFM headers ----------
+# ---------- CSV parsing (matches your uploaded file) ----------
 
-# Exact Dutch headers observed in your file:
 COL_HOLDER = "Positie houder"
 COL_ISSUER = "Naam van de emittent"
 COL_ISIN   = "ISIN"
@@ -160,7 +165,7 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
                 issuer=issuer,
                 issuer_isin=isin,
                 short_seller=holder,
-                net_short_pct=pct_raw if "%" in pct_raw else f"{pct_raw}%",  # cosmetic
+                net_short_pct=pct_raw if "%" in pct_raw else f"{pct_raw}%",
                 net_short_pct_num=pct_num,
                 position_date=date_raw,
                 position_date_iso=iso,
