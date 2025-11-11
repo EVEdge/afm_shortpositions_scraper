@@ -1,104 +1,110 @@
 # article_builder.py
 
-from typing import Dict
+from typing import Dict, Optional
 
-def _fmt_pct(n: float | str) -> str:
+AFM_SOURCE_LABEL = "klik hier"
+
+def _pct_nl(num: Optional[float], fallback: str = "") -> str:
+    """
+    Format percentage with Dutch comma separator.
+    - If num is provided: '1,20%'
+    - Else use fallback string as-is (and ensure it ends with %)
+    """
+    if num is not None:
+        try:
+            return f"{float(num):.2f}%".replace(".", ",")
+        except Exception:
+            pass
+    s = (fallback or "").strip()
+    if not s:
+        return ""
+    # normalize decimal separator in fallback to comma
+    s = s.replace(".", ",")
+    return s if s.endswith("%") else s + "%"
+
+def _nl_title(issuer: str, short_seller: str, pct_str: str) -> str:
+    # Example: "Voleon Capital Management LP meldt 1,2% shortpositie in Alfen N.V."
+    # Use one decimal in title for readability (e.g. 1,2%)
     try:
-        return f"{float(n):.2f}%"
+        # try to derive one-decimal string from pct_str
+        raw = pct_str.replace("%", "").replace(",", ".")
+        one = f"{float(raw):.1f}%".replace(".", ",")
     except Exception:
-        return str(n)
+        one = pct_str or ""
+    return f"{short_seller} meldt {one} shortpositie in {issuer}."
 
-def _title(issuer: str, short_seller: str, pct_str: str) -> str:
-    # Example: "Current Net Short Position: Adyen — Marshall Wace at 0.60%"
-    return f"Current Net Short Position: {issuer} — {short_seller} at {pct_str}"
-
-def _excerpt(issuer: str, short_seller: str, pct_str: str, date_iso: str) -> str:
-    d = date_iso or ""
+def _excerpt_nl(issuer: str, short_seller: str, pct_str: str, date_iso: str) -> str:
     return (
-        f"{short_seller} currently holds a net short position in {issuer} of {pct_str}. "
-        f"Based on AFM’s current register (date: {d})."
+        f"{short_seller} heeft een netto shortpositie van {pct_str} in {issuer}. "
+        f"Gebaseerd op het actuele AFM-register (datum: {date_iso})."
     )
 
-def _content_html(item: Dict) -> str:
-    issuer = item.get("issuer") or ""
-    isin = item.get("issuer_isin") or ""
-    short_seller = item.get("short_seller") or ""
-    pct_raw = item.get("net_short_pct") or ""
-    pct_num = item.get("net_short_pct_num") or 0.0
-    pct_fmt = _fmt_pct(pct_num) if pct_num else pct_raw
-    date_iso = item.get("position_date_iso") or item.get("position_date") or ""
-    source_url = item.get("source_url") or ""
+def _content_nl(item: Dict) -> str:
+    issuer        = item.get("issuer") or item.get("emittent") or ""
+    isin          = item.get("issuer_isin") or ""
+    short_seller  = item.get("short_seller") or item.get("melder") or ""
+    pct_num       = item.get("net_short_pct_num")
+    pct_raw       = item.get("net_short_pct") or ""
+    pct_str       = _pct_nl(pct_num, pct_raw)
+    date_iso      = item.get("position_date_iso") or item.get("position_date") or item.get("meldingsdatum") or ""
+    source_url    = item.get("source_url") or "https://www.afm.nl/nl-nl/sector/registers/meldingenregisters/netto-shortposities-actueel"
 
     parts: list[str] = []
-    parts.append("<h3>Net Short Position Snapshot</h3>")
+    parts.append("<h3>Overzicht van shortpositie</h3>")
     parts.append("<ul>")
-    parts.append(f"<li><strong>Issuer:</strong> {issuer}</li>")
+    parts.append(f"<li><strong>Aandeel:</strong> {issuer}</li>")
+    parts.append(f"<li><strong>Short seller:</strong> {short_seller}</li>")
+    # Example shows 'Meldingsdatum' twice; we include both labels using the same date for parity
+    if date_iso:
+        parts.append(f"<li><strong>Meldingsdatum:</strong> {date_iso}</li>")
+    parts.append(f"<li><strong>Positie:</strong> {pct_str}</li>")
     if isin:
         parts.append(f"<li><strong>ISIN:</strong> {isin}</li>")
-    parts.append(f"<li><strong>Short seller:</strong> {short_seller}</li>")
-    parts.append(f"<li><strong>Position:</strong> {pct_fmt}</li>")
     if date_iso:
-        parts.append(f"<li><strong>Date (AFM):</strong> {date_iso}</li>")
+        parts.append(f"<li><strong>Meldingsdatum:</strong> {date_iso}</li>")
     parts.append("</ul>")
 
+    parts.append("<h3>Disclaimer</h3>")
     parts.append(
-        "<p>This post is generated from the AFM register of current net short positions. "
-        "Percentages refer to the disclosed net short interest in the issuer’s outstanding share capital.</p>"
+        "<p>Deze publicatie is informatief en vormt geen beleggingsadvies. "
+        "De informatie op deze pagina is gebaseerd op het AFM-register voor nettoshortposities. "
+        "De publicaties van het register zijn openbaar en bereikbaar via de AFM-website: "
+        f'<a href="{source_url}" target="_blank" rel="nofollow noopener">{AFM_SOURCE_LABEL}</a>. '
+        "Pennywatch.nl is niet gelieerd aan de Autoriteit Financiële Markten (AFM). "
+        "Pennywatch.nl geeft geen garanties over de juistheid of volledigheid van de informatie.</p>"
     )
-
-    if source_url:
-        parts.append(
-            f'<p><em>Source:</em> <a href="{source_url}" rel="nofollow noopener" target="_blank">'
-            "AFM – Current Net Short Positions</a></p>"
-        )
-
-    parts.append("<h4>Notes</h4>")
-    parts.append("<ul>")
-    parts.append("<li>Positions can change frequently; consult the AFM register for the latest status.</li>")
-    parts.append("<li>Thresholds start at 0.5% and must be updated at each 0.1% change thereafter.</li>")
-    parts.append("</ul>")
-    parts.append("<p><em>Disclaimer: This is not investment advice. Do your own research.</em></p>")
 
     return "\n".join(parts)
 
 def build_article(item: Dict, *, category_id: int | None = None) -> Dict:
-    """
-    Build a WordPress-ready payload from a ShortPosition dict.
-    """
-    issuer = item.get("issuer") or ""
-    short_seller = item.get("short_seller") or ""
-    pct_raw = item.get("net_short_pct") or ""
-    pct_num = item.get("net_short_pct_num") or 0.0
-    pct_fmt = _fmt_pct(pct_num) if pct_num else pct_raw
-    date_iso = item.get("position_date_iso") or item.get("position_date") or ""
+    issuer        = item.get("issuer") or item.get("emittent") or ""
+    short_seller  = item.get("short_seller") or item.get("melder") or ""
+    pct_num       = item.get("net_short_pct_num")
+    pct_raw       = item.get("net_short_pct") or ""
+    pct_str       = _pct_nl(pct_num, pct_raw)
+    date_iso      = item.get("position_date_iso") or item.get("position_date") or item.get("meldingsdatum") or ""
 
-    title = _title(issuer, short_seller, pct_fmt)
-    excerpt = _excerpt(issuer, short_seller, pct_fmt, date_iso)
-    content = _content_html(item)
-
-    tags = list(filter(None, {issuer, short_seller}))
+    title   = _nl_title(issuer, short_seller, pct_str)
+    excerpt = _excerpt_nl(issuer, short_seller, pct_str, date_iso)
+    content = _content_nl(item)
 
     payload: Dict = {
         "title": title,
-        "status": "publish",           # caller can override
+        "status": "publish",
         "excerpt": excerpt,
         "content": content,
+        # Let publisher resolve tag names to IDs
+        "tags": list(filter(None, {issuer, short_seller})),
         "meta": {
-            "afm_unique_id": item.get("unique_id"),
+            "afm_unique_id": item.get("unique_id") or item.get("afm_key"),
             "afm_date": date_iso,
+            "type": "shortpositie",
         },
-        # If your publisher resolves tag names to IDs, keep these as names.
-        "tags": tags,
     }
     if category_id is not None:
         payload["categories"] = [int(category_id)]
     return payload
 
-# Backward-compatibility aliases
+# Backward-compat alias if something calls build_post()
 def build_post(item: Dict, *, category_id: int | None = None) -> Dict:
     return build_article(item, category_id=category_id)
-
-def build_afm_article(item: Dict, *, category_id: int | None = None) -> Dict:
-    return build_article(item, category_id=category_id)
-
-__all__ = ["build_article", "build_post", "build_afm_article"]
