@@ -1,8 +1,7 @@
-# article_builder.py
-
 from typing import Dict, Optional
 
 AFM_SOURCE_LABEL = "klik hier"
+AFM_SOURCE_URL_FALLBACK = "https://www.afm.nl/nl-nl/sector/registers/meldingenregisters/netto-shortposities-actueel"
 
 def _pct_nl(num: Optional[float], fallback: str = "") -> str:
     """
@@ -18,15 +17,12 @@ def _pct_nl(num: Optional[float], fallback: str = "") -> str:
     s = (fallback or "").strip()
     if not s:
         return ""
-    # normalize decimal separator in fallback to comma
     s = s.replace(".", ",")
     return s if s.endswith("%") else s + "%"
 
 def _nl_title(issuer: str, short_seller: str, pct_str: str) -> str:
     # Example: "Voleon Capital Management LP meldt 1,2% shortpositie in Alfen N.V."
-    # Use one decimal in title for readability (e.g. 1,2%)
     try:
-        # try to derive one-decimal string from pct_str
         raw = pct_str.replace("%", "").replace(",", ".")
         one = f"{float(raw):.1f}%".replace(".", ",")
     except Exception:
@@ -47,14 +43,13 @@ def _content_nl(item: Dict) -> str:
     pct_raw       = item.get("net_short_pct") or ""
     pct_str       = _pct_nl(pct_num, pct_raw)
     date_iso      = item.get("position_date_iso") or item.get("position_date") or item.get("meldingsdatum") or ""
-    source_url    = item.get("source_url") or "https://www.afm.nl/nl-nl/sector/registers/meldingenregisters/netto-shortposities-actueel"
+    source_url    = item.get("source_url") or AFM_SOURCE_URL_FALLBACK
 
     parts: list[str] = []
     parts.append("<h3>Overzicht van shortpositie</h3>")
     parts.append("<ul>")
     parts.append(f"<li><strong>Aandeel:</strong> {issuer}</li>")
     parts.append(f"<li><strong>Short seller:</strong> {short_seller}</li>")
-    # Example shows 'Meldingsdatum' twice; we include both labels using the same date for parity
     if date_iso:
         parts.append(f"<li><strong>Meldingsdatum:</strong> {date_iso}</li>")
     parts.append(f"<li><strong>Positie:</strong> {pct_str}</li>")
@@ -66,12 +61,12 @@ def _content_nl(item: Dict) -> str:
 
     parts.append("<h3>Disclaimer</h3>")
     parts.append(
-        "<p>Deze publicatie is informatief en vormt geen beleggingsadvies. "
+        "<p><em>Deze publicatie is informatief en vormt geen beleggingsadvies. "
         "De informatie op deze pagina is gebaseerd op het AFM-register voor nettoshortposities. "
         "De publicaties van het register zijn openbaar en bereikbaar via de AFM-website: "
         f'<a href="{source_url}" target="_blank" rel="nofollow noopener">{AFM_SOURCE_LABEL}</a>. '
         "Pennywatch.nl is niet gelieerd aan de Autoriteit Financiële Markten (AFM). "
-        "Pennywatch.nl geeft geen garanties over de juistheid of volledigheid van de informatie.</p>"
+        "Pennywatch.nl geeft geen garanties over de juistheid of volledigheid van de informatie.</em></p>"
     )
 
     return "\n".join(parts)
@@ -93,7 +88,7 @@ def build_article(item: Dict, *, category_id: int | None = None) -> Dict:
         "status": "publish",
         "excerpt": excerpt,
         "content": content,
-        # Let publisher resolve tag names to IDs
+        # Tags as names — publisher will resolve/create IDs
         "tags": list(filter(None, {issuer, short_seller})),
         "meta": {
             "afm_unique_id": item.get("unique_id") or item.get("afm_key"),
@@ -105,6 +100,5 @@ def build_article(item: Dict, *, category_id: int | None = None) -> Dict:
         payload["categories"] = [int(category_id)]
     return payload
 
-# Backward-compat alias if something calls build_post()
 def build_post(item: Dict, *, category_id: int | None = None) -> Dict:
     return build_article(item, category_id=category_id)
