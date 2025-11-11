@@ -1,3 +1,4 @@
+import os
 import csv
 import io
 import hashlib
@@ -10,12 +11,25 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import requests
 from bs4 import BeautifulSoup
 
-from company_filter_pennywatch import is_approved_company
-
 AFM_SHORTPOS_URL = "https://www.afm.nl/nl-nl/sector/registers/meldingenregisters/netto-shortposities-actueel"
 
+# Optional filter (OFF by default). Even if company_filter_pennywatch exists,
+# we will NOT drop any rows unless SHORTPOS_USE_FILTER=1.
+USE_FILTER = os.getenv("SHORTPOS_USE_FILTER", "0").strip().lower() in {"1", "true", "yes"}
+
+def _always_true(*_args, **_kwargs) -> bool:
+    return True
+
+if USE_FILTER:
+    try:
+        from company_filter_pennywatch import is_approved_company as _row_ok
+    except Exception:
+        _row_ok = _always_true
+else:
+    _row_ok = _always_true
+
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(os.getenv("PW_LOG_LEVEL", "INFO").upper())
 
 
 @dataclass
@@ -41,12 +55,19 @@ def _clean_text(x: str) -> str:
 
 
 def _pct_to_float(p: str) -> float:
-    if not p:
+    """Accept '0,60%', '0.60', '0,60' etc."""
+    if p is None:
         return 0.0
-    s = p.replace("%", "").replace(",", ".").strip()
+    s = str(p).replace("%", "").replace(",", ".").strip()
     try:
         return float(s)
     except ValueError:
+        m = re.search(r"(\d+(?:[.,]\d+)?)", s)
+        if m:
+            try:
+                return float(m.group(1).replace(",", "."))
+            except Exception:
+                return 0.0
         return 0.0
 
 
@@ -57,7 +78,7 @@ def _parse_date(d: str) -> Tuple[str, str]:
             iso = datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
             return raw, iso
         except ValueError:
-            continue
+            pass
     m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", raw)
     if m:
         return raw, f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
@@ -105,12 +126,13 @@ def _pick_best_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
         s = _score_table(heads)
         if s > score:
             best, score = tbl, s
+    if best:
+        logger.info("Using table with score %s", score)
     return best
 
 def _header_map(tbl: BeautifulSoup) -> Dict[str, int]:
     idx: Dict[str, int] = {}
     headers = [h.lower() for h in _table_headers(tbl)]
-
     for i, txt in enumerate(headers):
         if any(k in txt for k in ["uitgevende instelling", "issuer", "uitgevende"]):
             idx["issuer"] = i
@@ -123,25 +145,22 @@ def _header_map(tbl: BeautifulSoup) -> Dict[str, int]:
         elif any(k in txt for k in ["datum", "date"]):
             idx["date"] = i
 
-    # Heuristic fallback
     if {"issuer", "short_seller", "net_short_pct"} <= idx.keys():
         return idx
+
+    # Heuristic fallback on first row
     first = next(_iter_rows(tbl), None)
     if not first:
         return idx
     texts = [_clean_text(td.get_text()) for td in first]
 
-    # % column
     for i, t in enumerate(texts):
         if re.search(r"\d[\d\.,]*\s*%", t):
             idx.setdefault("net_short_pct", i)
-    # date column
     for i, t in enumerate(texts):
         if re.search(r"\d{2}[-/]\d{2}[-/]\d{2,4}|\d{4}[-/]\d{2}[-/]\d{2}", t):
             idx.setdefault("date", i)
-    # issuer default first col
     idx.setdefault("issuer", 0)
-    # short_seller: the longest remaining cell
     if "short_seller" not in idx:
         candidates = []
         for i, t in enumerate(texts):
@@ -151,12 +170,16 @@ def _header_map(tbl: BeautifulSoup) -> Dict[str, int]:
         if candidates:
             _, i = max(candidates)
             idx["short_seller"] = i
+    logger.info("Header map (with heuristics): %s", idx)
     return idx
 
 def _parse_from_table(tbl: BeautifulSoup) -> List[ShortPosition]:
     hmap = _header_map(tbl)
     out: List[ShortPosition] = []
+    seen = 0
     for tds in _iter_rows(tbl):
+        seen += 1
+
         def pick(key: str) -> str:
             i = hmap.get(key, -1)
             return _clean_text(tds[i].get_text()) if 0 <= i < len(tds) else ""
@@ -182,12 +205,13 @@ def _parse_from_table(tbl: BeautifulSoup) -> List[ShortPosition]:
 
         if not issuer or not short_seller or not net_pct_raw:
             continue
-        if not is_approved_company(issuer, issuer_isin):
+        if not _row_ok(issuer, issuer_isin):
             continue
 
         pct_num = _pct_to_float(net_pct_raw)
         date_raw, iso = _parse_date(date_raw or "")
         uid = _make_uid(issuer, short_seller, iso, net_pct_raw)
+
         out.append(
             ShortPosition(
                 issuer=issuer,
@@ -201,6 +225,7 @@ def _parse_from_table(tbl: BeautifulSoup) -> List[ShortPosition]:
                 unique_id=uid,
             )
         )
+    logger.info("HTML: rows seen=%d; kept=%d", seen, len(out))
     return out
 
 
@@ -216,10 +241,18 @@ def _find_download_link(soup: BeautifulSoup) -> Optional[str]:
             return href
     return None
 
+def _decode_best(content: bytes) -> str:
+    for enc in ("utf-8", "utf-16", "cp1252", "latin-1"):
+        try:
+            return content.decode(enc)
+        except Exception:
+            continue
+    return content.decode("utf-8", errors="ignore")
+
 def _parse_csv(text: str) -> List[ShortPosition]:
     out: List[ShortPosition] = []
     try:
-        dialect = csv.Sniffer().sniff(text[:2048], delimiters=";,\t")
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=";,\t")
         delim = dialect.delimiter
     except Exception:
         delim = ";"
@@ -236,14 +269,15 @@ def _parse_csv(text: str) -> List[ShortPosition]:
                 return _clean_text(lower[k.lower()])
         return ""
 
-    # AFM CSV commonly uses these headers (Dutch/English variants):
     SE_ISSUER   = ["Uitgevende instelling", "Issuer", "Uitgevende"]
     SE_ISIN     = ["ISIN"]
     SE_HOLDER   = ["Partij", "Houder", "Short seller", "Meldingsplichtige"]
-    SE_PERCENT  = ["Netto shortpositie", "Net short position", "Netto-shortpositie", "%"]
+    SE_PERCENT  = ["Netto shortpositie", "Net short position", "Netto-shortpositie", "%", "Net short %"]
     SE_DATE     = ["Datum", "Date", "Datum melding", "Meldingsdatum"]
 
+    seen = 0
     for row in reader:
+        seen += 1
         issuer = get(row, SE_ISSUER)
         issuer_isin = get(row, SE_ISIN) or None
         short_seller = get(row, SE_HOLDER)
@@ -252,7 +286,7 @@ def _parse_csv(text: str) -> List[ShortPosition]:
 
         if not issuer or not short_seller or not net_pct_raw:
             continue
-        if not is_approved_company(issuer, issuer_isin):
+        if not _row_ok(issuer, issuer_isin):
             continue
 
         pct_num = _pct_to_float(net_pct_raw)
@@ -272,12 +306,14 @@ def _parse_csv(text: str) -> List[ShortPosition]:
                 unique_id=uid,
             )
         )
+    logger.info("CSV: rows seen=%d; kept=%d", seen, len(out))
     return out
 
 
 # ------------------------- main scrape -------------------------
 
 def scrape_short_positions() -> List[ShortPosition]:
+    logger.info("Fetching AFM page (filter_enabled=%s): %s", USE_FILTER, AFM_SHORTPOS_URL)
     resp = requests.get(
         AFM_SHORTPOS_URL,
         headers={
@@ -291,7 +327,7 @@ def scrape_short_positions() -> List[ShortPosition]:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # 1) Try HTML
+    # 1) Try HTML table
     tbl = _pick_best_table(soup)
     if tbl:
         items = _parse_from_table(tbl)
@@ -301,9 +337,14 @@ def scrape_short_positions() -> List[ShortPosition]:
     # 2) CSV fallback
     csv_url = _find_download_link(soup)
     if csv_url:
-        csv_resp = requests.get(csv_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        logger.info("Attempting CSV download: %s", csv_url)
+        csv_resp = requests.get(
+            csv_url,
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; PennywatchScraper/1.0)"},
+        )
         csv_resp.raise_for_status()
-        text = csv_resp.content.decode("utf-8", errors="ignore")
+        text = _decode_best(csv_resp.content)
         items = _parse_csv(text)
         if items:
             return items
@@ -312,11 +353,11 @@ def scrape_short_positions() -> List[ShortPosition]:
     return []
 
 
-# ---- public API (compat with existing main.py) ----
+# ------------------------- public API (compat) -------------------------
 
 def fetch_items() -> List[Dict]:
     return [sp.to_dict() for sp in scrape_short_positions()]
 
 def fetch_afm_table() -> List[Dict]:
-    """Deprecated alias used by existing main.py."""
+    """Backward-compatible alias for existing main.py."""
     return fetch_items()
