@@ -1,7 +1,8 @@
+# publisher.py
 import os
 import time
 import logging
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Union
 
 import requests
 from article_builder import build_article
@@ -34,19 +35,12 @@ def _posts_url() -> str:
 
 
 def _ensure_list_category(payload: Dict) -> None:
-    # WordPress expects a LIST of IDs.
     if WP_CATEGORY_ID:
         payload["categories"] = [WP_CATEGORY_ID]
 
 
 def _dedupe_key(item: Dict) -> Optional[str]:
-    # Keep the key in meta for later if you want dedupe, but DO NOT skip on it.
     return item.get("afm_key") or item.get("unique_id")
-
-
-def _resolve_tags_to_ids_if_needed(payload: Dict) -> None:
-    # Send tag names; let WP create/resolve — keep as no-op unless you need IDs.
-    return
 
 
 def _post_to_wordpress(payload: Dict) -> Dict:
@@ -65,21 +59,18 @@ def _post_to_wordpress(payload: Dict) -> Dict:
 def publish_items(items: List[Dict]) -> int:
     """
     Publish EVERYTHING (no skip conditions), up to MAX_POSTS_PER_RUN.
+    Expects a list of *source records* (not yet article payloads).
     """
     created = 0
-
     for item in items:
         if created >= MAX_POSTS_PER_RUN:
             break
 
-        # Build post payload
         payload = build_article(item, category_id=WP_CATEGORY_ID)
         payload["status"] = WP_PUBLISH_STATUS
 
         _ensure_list_category(payload)
-        _resolve_tags_to_ids_if_needed(payload)
 
-        # carry over a stable key if present (but don't use it to skip)
         afm_key = _dedupe_key(item)
         if afm_key:
             payload.setdefault("meta", {})
@@ -88,7 +79,7 @@ def publish_items(items: List[Dict]) -> int:
         try:
             _post_to_wordpress(payload)
             created += 1
-            time.sleep(0.3)  # be nice to WP
+            time.sleep(0.3)
         except Exception as e:
             logger.error("Failed to publish item (afm_key=%s): %s", afm_key, e)
 
@@ -96,6 +87,29 @@ def publish_items(items: List[Dict]) -> int:
     return created
 
 
-# ---- Backward-compat alias for main.py ----
-def publish_to_wordpress(items: List[Dict]) -> int:
-    return publish_items(items)
+# ---- Backward-compat entrypoint used by main.py ----
+def publish_to_wordpress(arg: Union[Dict, List[Dict]]) -> int:
+    """
+    Accepts EITHER:
+      - a single already-built article payload (dict) -> posts it immediately
+      - a list of source records (list[dict]) -> delegates to publish_items()
+    Returns number of posts published.
+    """
+    # Case 1: single article payload
+    if isinstance(arg, dict):
+        payload = dict(arg)  # shallow copy
+        payload.setdefault("status", WP_PUBLISH_STATUS)
+        _ensure_list_category(payload)
+        try:
+            _post_to_wordpress(payload)
+            logger.info("Published 1 item (single payload).")
+            return 1
+        except Exception as e:
+            logger.error("Failed to publish single payload: %s", e)
+            return 0
+
+    # Case 2: list of source records
+    if isinstance(arg, list):
+        return publish_items(arg)
+
+    raise TypeError("publish_to_wordpress expects a dict (single payload) or list[dict] (records).")
