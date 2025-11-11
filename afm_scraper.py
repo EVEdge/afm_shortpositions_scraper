@@ -137,4 +137,186 @@ def _header_map(tbl: BeautifulSoup) -> Dict[str, int]:
             idx.setdefault("net_short_pct", i)
     # date column
     for i, t in enumerate(texts):
-        if re.search(r"\d{2}[-/]\d{2}[-/]\d{2,4}|\d{4}[-/]\d{2}[-/]\d{2}"
+        if re.search(r"\d{2}[-/]\d{2}[-/]\d{2,4}|\d{4}[-/]\d{2}[-/]\d{2}", t):
+            idx.setdefault("date", i)
+    # issuer default first col
+    idx.setdefault("issuer", 0)
+    # short_seller: the longest remaining cell
+    if "short_seller" not in idx:
+        candidates = []
+        for i, t in enumerate(texts):
+            if i in {idx.get("issuer", -1), idx.get("net_short_pct", -1), idx.get("date", -1)}:
+                continue
+            candidates.append((len(t), i))
+        if candidates:
+            _, i = max(candidates)
+            idx["short_seller"] = i
+    return idx
+
+def _parse_from_table(tbl: BeautifulSoup) -> List[ShortPosition]:
+    hmap = _header_map(tbl)
+    out: List[ShortPosition] = []
+    for tds in _iter_rows(tbl):
+        def pick(key: str) -> str:
+            i = hmap.get(key, -1)
+            return _clean_text(tds[i].get_text()) if 0 <= i < len(tds) else ""
+
+        issuer = pick("issuer")
+        issuer_isin = pick("isin") or None
+        short_seller = pick("short_seller")
+        net_pct_raw = pick("net_short_pct")
+        date_raw = pick("date")
+
+        if not net_pct_raw:
+            for td in tds:
+                txt = _clean_text(td.get_text())
+                if re.search(r"\d[\d\.,]*\s*%", txt):
+                    net_pct_raw = txt
+                    break
+        if not date_raw:
+            for td in tds:
+                txt = _clean_text(td.get_text())
+                if re.search(r"\d{2}[-/]\d{2}[-/]\d{2,4}|\d{4}[-/]\d{2}[-/]\d{2}", txt):
+                    date_raw = txt
+                    break
+
+        if not issuer or not short_seller or not net_pct_raw:
+            continue
+        if not is_approved_company(issuer, issuer_isin):
+            continue
+
+        pct_num = _pct_to_float(net_pct_raw)
+        date_raw, iso = _parse_date(date_raw or "")
+        uid = _make_uid(issuer, short_seller, iso, net_pct_raw)
+        out.append(
+            ShortPosition(
+                issuer=issuer,
+                issuer_isin=issuer_isin,
+                short_seller=short_seller,
+                net_short_pct=net_pct_raw,
+                net_short_pct_num=pct_num,
+                position_date=date_raw,
+                position_date_iso=iso,
+                source_url=AFM_SHORTPOS_URL,
+                unique_id=uid,
+            )
+        )
+    return out
+
+
+# ------------------------- CSV fallback -------------------------
+
+def _find_download_link(soup: BeautifulSoup) -> Optional[str]:
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        label = _clean_text(a.get_text()).lower()
+        if ".csv" in href.lower() or "csv" in label or "download" in label:
+            if href.startswith("/"):
+                return "https://www.afm.nl" + href
+            return href
+    return None
+
+def _parse_csv(text: str) -> List[ShortPosition]:
+    out: List[ShortPosition] = []
+    try:
+        dialect = csv.Sniffer().sniff(text[:2048], delimiters=";,\t")
+        delim = dialect.delimiter
+    except Exception:
+        delim = ";"
+
+    reader = csv.DictReader(io.StringIO(text), delimiter=delim)
+
+    def get(row: Dict, keys: List[str]) -> str:
+        for k in keys:
+            if k in row and row[k]:
+                return _clean_text(row[k])
+        lower = {k.lower(): v for k, v in row.items()}
+        for k in keys:
+            if k.lower() in lower and lower[k.lower()]:
+                return _clean_text(lower[k.lower()])
+        return ""
+
+    # AFM CSV commonly uses these headers (Dutch/English variants):
+    SE_ISSUER   = ["Uitgevende instelling", "Issuer", "Uitgevende"]
+    SE_ISIN     = ["ISIN"]
+    SE_HOLDER   = ["Partij", "Houder", "Short seller", "Meldingsplichtige"]
+    SE_PERCENT  = ["Netto shortpositie", "Net short position", "Netto-shortpositie", "%"]
+    SE_DATE     = ["Datum", "Date", "Datum melding", "Meldingsdatum"]
+
+    for row in reader:
+        issuer = get(row, SE_ISSUER)
+        issuer_isin = get(row, SE_ISIN) or None
+        short_seller = get(row, SE_HOLDER)
+        net_pct_raw = get(row, SE_PERCENT)
+        date_raw = get(row, SE_DATE)
+
+        if not issuer or not short_seller or not net_pct_raw:
+            continue
+        if not is_approved_company(issuer, issuer_isin):
+            continue
+
+        pct_num = _pct_to_float(net_pct_raw)
+        date_raw, iso = _parse_date(date_raw or "")
+        uid = _make_uid(issuer, short_seller, iso, net_pct_raw)
+
+        out.append(
+            ShortPosition(
+                issuer=issuer,
+                issuer_isin=issuer_isin,
+                short_seller=short_seller,
+                net_short_pct=net_pct_raw,
+                net_short_pct_num=pct_num,
+                position_date=date_raw,
+                position_date_iso=iso,
+                source_url=AFM_SHORTPOS_URL,
+                unique_id=uid,
+            )
+        )
+    return out
+
+
+# ------------------------- main scrape -------------------------
+
+def scrape_short_positions() -> List[ShortPosition]:
+    resp = requests.get(
+        AFM_SHORTPOS_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; PennywatchScraper/1.0)",
+            "Accept-Language": "nl,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # 1) Try HTML
+    tbl = _pick_best_table(soup)
+    if tbl:
+        items = _parse_from_table(tbl)
+        if items:
+            return items
+
+    # 2) CSV fallback
+    csv_url = _find_download_link(soup)
+    if csv_url:
+        csv_resp = requests.get(csv_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        csv_resp.raise_for_status()
+        text = csv_resp.content.decode("utf-8", errors="ignore")
+        items = _parse_csv(text)
+        if items:
+            return items
+
+    logger.warning("AFM short positions: found 0 items.")
+    return []
+
+
+# ---- public API (compat with existing main.py) ----
+
+def fetch_items() -> List[Dict]:
+    return [sp.to_dict() for sp in scrape_short_positions()]
+
+def fetch_afm_table() -> List[Dict]:
+    """Deprecated alias used by existing main.py."""
+    return fetch_items()
