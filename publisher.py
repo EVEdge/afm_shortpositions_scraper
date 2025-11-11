@@ -41,15 +41,25 @@ def _tags_url() -> str:
 # cache tag name -> id per run
 _TAG_CACHE: dict[str, int] = {}
 
+def _sanitize_tag_name(name: str) -> str:
+    s = str(name).strip()
+    # soften problematic punctuation for slugs like "D. E. Shaw & Co., L.P."
+    s = s.replace("&", "and")
+    for ch in [",", ".", ";", ":", "’", "'", '"', "(", ")", "[", "]", "{", "}", "/", "\\"]:
+        s = s.replace(ch, " ")
+    # collapse spaces and trim to a safe WP limit
+    s = " ".join(s.split())[:190]
+    return s or "tag"
+
 def _get_or_create_tag_id(name: str) -> Optional[int]:
-    """Resolve a tag name to an ID; create it if missing."""
+    """Resolve a tag name to an ID; create it if missing (handles term_exists)."""
     if not name:
         return None
-    key = name.strip().lower()
+    key = str(name).strip().lower()
     if key in _TAG_CACHE:
         return _TAG_CACHE[key]
 
-    # 1) try search
+    # 1) try search (exact match, case-insensitive)
     try:
         resp = requests.get(
             _tags_url(),
@@ -65,22 +75,41 @@ def _get_or_create_tag_id(name: str) -> Optional[int]:
     except Exception as e:
         logger.warning("Tag search failed for '%s': %s", name, e)
 
-    # 2) create
-    try:
-        resp = requests.post(
+    def _post_tag(tag_name: str) -> Optional[int]:
+        r = requests.post(
             _tags_url(),
             auth=_auth(),
-            json={"name": name},
+            json={"name": tag_name},
             timeout=30,
             headers={"Content-Type": "application/json"},
         )
-        resp.raise_for_status()
-        tid = int(resp.json()["id"])
+        if r.status_code == 201:
+            return int(r.json()["id"])
+        # Handle common WP error: term already exists
+        try:
+            data = r.json()
+            if isinstance(data, dict) and data.get("code") == "term_exists":
+                return int(data.get("data", {}).get("term_id"))
+        except Exception:
+            pass
+        return None
+
+    # 2) try create with original name
+    tid = _post_tag(name)
+    if tid:
         _TAG_CACHE[key] = tid
         return tid
-    except Exception as e:
-        logger.error("Tag create failed for '%s': %s", name, e)
-        return None
+
+    # 3) sanitize and retry once
+    clean = _sanitize_tag_name(name)
+    if clean != name:
+        tid = _post_tag(clean)
+        if tid:
+            _TAG_CACHE[key] = tid
+            return tid
+
+    logger.error("Tag create failed for '%s'", name)
+    return None
 
 def _ensure_categories(payload: Dict) -> None:
     if WP_CATEGORY_ID:
@@ -109,7 +138,6 @@ def _normalize_tags(payload: Dict) -> None:
                 if tid:
                     ids.append(tid)
     else:
-        # single value
         if isinstance(raw, int):
             ids = [raw]
         else:
@@ -120,7 +148,7 @@ def _normalize_tags(payload: Dict) -> None:
     if ids:
         payload["tags"] = ids
     else:
-        # nothing resolved — drop the field to avoid 400
+        # nothing resolved — drop the field to avoid WP 400
         payload.pop("tags", None)
 
 def _post_to_wordpress(payload: Dict) -> Dict:
@@ -159,7 +187,7 @@ def publish_items(items: List[Dict]) -> int:
 
 def publish_to_wordpress(arg: Union[Dict, List[Dict]]) -> int:
     """
-    Back-compat: accept either a single article payload (dict) or
+    Back-compat: accept either a single already-built article payload (dict) or
     a list of source records (list[dict]).
     """
     if isinstance(arg, dict):
