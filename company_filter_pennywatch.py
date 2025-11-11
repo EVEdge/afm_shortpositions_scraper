@@ -48,3 +48,4 @@ def is_approved_company(issuer_name: str | None, issuer_isin: str | None = None)
         isin_ok = (issuer_isin or "").upper() in ALLOW_ISINS
 
     return bool(name_ok and isin_ok)
+
