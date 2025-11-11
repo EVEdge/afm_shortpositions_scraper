@@ -15,11 +15,17 @@ from company_filter_pennywatch import is_approved_company
 
 AFM_SHORTPOS_URL = "https://www.afm.nl/nl-nl/sector/registers/meldingenregisters/netto-shortposities-actueel"
 
-# Set PENNYWATCH_BYPASS_FILTER=1 to ignore the company filter during debugging
-BYPASS_FILTER = os.getenv("PENNYWATCH_BYPASS_FILTER", "0") in {"1", "true", "True"}
+# ---- Debug toggles ----
+BYPASS_FILTER = os.getenv("PENNYWATCH_BYPASS_FILTER", "0").lower() in {"1", "true", "yes"}
+LOG_LEVEL = os.getenv("PW_LOG_LEVEL", "INFO").upper()
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(LOG_LEVEL or "INFO")
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setLevel(LOG_LEVEL or "INFO")
+    ch.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(ch)
 
 
 @dataclass
@@ -62,6 +68,12 @@ def _parse_date(d: str) -> Tuple[str, str]:
             return raw, iso
         except ValueError:
             continue
+    # try to normalize dd-mm-yyyy inside text
+    m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", raw)
+    if m:
+        iso = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+        return raw, iso
+    # or yyyy-mm-dd
     m = re.search(r"(\d{4})[-/](\d{2})[-/](\d{2})", raw)
     if m:
         iso = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
@@ -76,85 +88,133 @@ def _make_uid(issuer: str, short_seller: str, iso_date: str, pct: str) -> str:
 
 # ------------------------- HTML flow -------------------------
 
-def _find_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
+def _all_tables(soup: BeautifulSoup) -> List[BeautifulSoup]:
     tables = soup.find_all("table")
-    if not tables:
-        return None
-
-    def headers_of(tbl: BeautifulSoup) -> List[str]:
-        heads = []
-        thead = tbl.find("thead")
-        if thead:
-            for th in thead.find_all("th"):
-                heads.append(_clean_text(th.get_text()))
-        else:
-            first_row = tbl.find("tr")
-            if first_row:
-                for th in first_row.find_all(["th", "td"]):
-                    heads.append(_clean_text(th.get_text()))
-        return [h.lower() for h in heads]
-
-    for t in tables:
-        lower_heads = headers_of(t)
-        if any("netto" in h and "short" in h for h in lower_heads) or any(
-            "shortpositie" in h for h in lower_heads
-        ):
-            logger.info("Found AFM table with headers: %s", lower_heads)
-            return t
-
-    logger.info("Falling back to first table; headers unknown.")
-    return tables[0]
+    logger.debug("Found %d <table> elements on page.", len(tables))
+    return tables
 
 
-def _header_map(table: BeautifulSoup) -> Dict[str, int]:
-    map_idx: Dict[str, int] = {}
-    thead = table.find("thead")
-    headers = []
+def _table_headers(tbl: BeautifulSoup) -> List[str]:
+    heads = []
+    thead = tbl.find("thead")
     if thead:
-        headers = thead.find_all("th")
+        for th in thead.find_all("th"):
+            heads.append(_clean_text(th.get_text()))
     else:
-        first_tr = table.find("tr")
-        headers = first_tr.find_all(["th", "td"]) if first_tr else []
-
-    for i, th in enumerate(headers):
-        txt = _clean_text(th.get_text()).lower()
-        if any(k in txt for k in ["uitgevende instelling", "issuer", "uitgevende"]):
-            map_idx["issuer"] = i
-        if "isin" in txt:
-            map_idx["isin"] = i
-        if any(k in txt for k in ["partij", "short", "meldingsplichtige", "houder"]):
-            map_idx["short_seller"] = i
-        if any(k in txt for k in ["netto short", "netto-short", "shortpositie", "%"]):
-            map_idx["net_short_pct"] = i
-        if any(k in txt for k in ["datum", "date"]):
-            map_idx["date"] = i
-
-    logger.info("Header map: %s", map_idx)
-    return map_idx
+        first_row = tbl.find("tr")
+        if first_row:
+            for th in first_row.find_all(["th", "td"]):
+                heads.append(_clean_text(th.get_text()))
+    return heads
 
 
-def _iter_rows(table: BeautifulSoup) -> Iterable[List[BeautifulSoup]]:
-    tbody = table.find("tbody") or table
+def _iter_rows(tbl: BeautifulSoup) -> Iterable[List[BeautifulSoup]]:
+    tbody = tbl.find("tbody") or tbl
     for tr in tbody.find_all("tr"):
         tds = tr.find_all("td")
-        if not tds:
-            continue
-        yield tds
+        if tds:
+            yield tds
 
 
-def _parse_rows_from_table(table: BeautifulSoup) -> List[ShortPosition]:
-    hmap = _header_map(table)
+def _score_table(headers_lower: List[str]) -> int:
+    """
+    Rank tables by how likely they are the short-positions table.
+    """
+    keys = ["netto", "short", "positie", "shortpositie", "partij", "datum", "issuer", "uitgevende"]
+    score = sum(1 for h in headers_lower for k in keys if k in h)
+    return score
+
+
+def _pick_best_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
+    best_tbl = None
+    best_score = -1
+    for tbl in _all_tables(soup):
+        heads = [h.lower() for h in _table_headers(tbl)]
+        score = _score_table(heads)
+        logger.debug("Table headers: %s | score=%d", heads, score)
+        if score > best_score:
+            best_tbl, best_score = tbl, score
+    if best_tbl:
+        logger.info("Using table with score %d", best_score)
+    return best_tbl
+
+
+def _header_map(tbl: BeautifulSoup) -> Dict[str, int]:
+    """
+    Try to map columns by header text; if that fails, fall back to heuristics on the first row.
+    """
+    idx: Dict[str, int] = {}
+    headers = _table_headers(tbl)
+    headers_lower = [h.lower() for h in headers]
+    logger.debug("Detected headers: %s", headers_lower)
+
+    for i, txt in enumerate(headers_lower):
+        if any(k in txt for k in ["uitgevende instelling", "issuer", "uitgevende"]):
+            idx["issuer"] = i
+        elif "isin" in txt:
+            idx["isin"] = i
+        elif any(k in txt for k in ["partij", "short", "meldingsplichtige", "houder"]):
+            idx["short_seller"] = i
+        elif any(k in txt for k in ["netto", "shortpositie", "%"]):
+            idx["net_short_pct"] = i
+        elif any(k in txt for k in ["datum", "date"]):
+            idx["date"] = i
+
+    if {"issuer", "short_seller", "net_short_pct"} <= idx.keys():
+        return idx
+
+    # Heuristic fallback using first data row
+    first = next(_iter_rows(tbl), None)
+    if not first:
+        return idx
+
+    texts = [_clean_text(td.get_text()) for td in first]
+    logger.debug("First-row texts for heuristic mapping: %s", texts)
+
+    # percent column: contains a %
+    for i, t in enumerate(texts):
+        if re.search(r"\d[\d\.,]*\s*%", t):
+            idx.setdefault("net_short_pct", i)
+
+    # date column: contains a typical date pattern
+    for i, t in enumerate(texts):
+        if re.search(r"\d{2}[-/]\d{2}[-/]\d{2,4}|\d{4}[-/]\d{2}[-/]\d{2}", t):
+            idx.setdefault("date", i)
+
+    # issuer: often first column
+    if "issuer" not in idx and texts:
+        idx["issuer"] = 0
+
+    # short_seller: pick the longest non-pct/date text that isn't issuer
+    if "short_seller" not in idx:
+        candidates = []
+        for i, t in enumerate(texts):
+            if i == idx.get("issuer"):
+                continue
+            if i == idx.get("net_short_pct"):
+                continue
+            if i == idx.get("date"):
+                continue
+            candidates.append((len(t), i))
+        if candidates:
+            _, i = max(candidates)
+            idx["short_seller"] = i
+
+    logger.info("Header map (with heuristics): %s", idx)
+    return idx
+
+
+def _parse_from_table(tbl: BeautifulSoup) -> List[ShortPosition]:
+    hmap = _header_map(tbl)
     results: List[ShortPosition] = []
-    raw_count = 0
+    seen = 0
 
-    for tds in _iter_rows(table):
-        raw_count += 1
+    for tds in _iter_rows(tbl):
+        seen += 1
 
-        def pick(idx_key: str) -> str:
-            if idx_key not in hmap:
-                return ""
-            i = hmap[idx_key]
-            if i < len(tds):
+        def pick(key: str) -> str:
+            i = hmap.get(key, -1)
+            if i >= 0 and i < len(tds):
                 return _clean_text(tds[i].get_text())
             return ""
 
@@ -163,6 +223,21 @@ def _parse_rows_from_table(table: BeautifulSoup) -> List[ShortPosition]:
         short_seller = pick("short_seller")
         net_pct_raw = pick("net_short_pct")
         date_raw = pick("date")
+
+        # Fallbacks if heuristics missed:
+        if not net_pct_raw:
+            # find a td with % in it
+            for td in tds:
+                txt = _clean_text(td.get_text())
+                if re.search(r"\d[\d\.,]*\s*%", txt):
+                    net_pct_raw = txt
+                    break
+        if not date_raw:
+            for td in tds:
+                txt = _clean_text(td.get_text())
+                if re.search(r"\d{2}[-/]\d{2}[-/]\d{2,4}|\d{4}[-/]\d{2}[-/]\d{2}", txt):
+                    date_raw = txt
+                    break
 
         if not issuer or not short_seller or not net_pct_raw:
             continue
@@ -188,22 +263,20 @@ def _parse_rows_from_table(table: BeautifulSoup) -> List[ShortPosition]:
             )
         )
 
-    logger.info("HTML table rows seen: %d; kept after filtering: %d", raw_count, len(results))
+    logger.info("HTML: rows seen=%d; kept=%d", seen, len(results))
     return results
 
 
 # ------------------------- CSV fallback -------------------------
 
-def _try_csv_from_page(soup: BeautifulSoup) -> Optional[str]:
+def _find_download_link(soup: BeautifulSoup) -> Optional[str]:
     """
-    Look for a CSV download link on the page.
-    We consider <a> tags whose href contains 'csv' or endswith '.csv'.
+    Find a CSV/Download link on the page.
     """
     for a in soup.find_all("a", href=True):
         href = a["href"]
         label = _clean_text(a.get_text()).lower()
-        if ".csv" in href.lower() or "csv" in label:
-            # Make absolute
+        if ".csv" in href.lower() or "csv" in label or "download" in label:
             if href.startswith("/"):
                 return "https://www.afm.nl" + href
             return href
@@ -212,32 +285,27 @@ def _try_csv_from_page(soup: BeautifulSoup) -> Optional[str]:
 
 def _parse_csv(text: str) -> List[ShortPosition]:
     results: List[ShortPosition] = []
-
-    # Try to sniff delimiter (AFM often uses semicolon)
-    sample = text[:1024]
     try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+        dialect = csv.Sniffer().sniff(text[:2048], delimiters=";,\t")
         delimiter = dialect.delimiter
     except Exception:
         delimiter = ";"
 
     reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
-    raw_count = 0
 
-    # Normalize common Dutch/English headers
     def get(row: Dict, keys: List[str]) -> str:
         for k in keys:
             if k in row and row[k]:
                 return _clean_text(row[k])
-        # try case-insensitive
         lower = {k.lower(): v for k, v in row.items()}
         for k in keys:
             if k.lower() in lower and lower[k.lower()]:
                 return _clean_text(lower[k.lower()])
         return ""
 
+    seen = 0
     for row in reader:
-        raw_count += 1
+        seen += 1
         issuer = get(row, ["Uitgevende instelling", "Issuer", "Uitgevende"])
         issuer_isin = get(row, ["ISIN"])
         short_seller = get(row, ["Partij", "Houder", "Short seller", "Meldingsplichtige"])
@@ -268,19 +336,20 @@ def _parse_csv(text: str) -> List[ShortPosition]:
             )
         )
 
-    logger.info("CSV rows seen: %d; kept after filtering: %d", raw_count, len(results))
+    logger.info("CSV: rows seen=%d; kept=%d", seen, len(results))
     return results
 
 
 # ------------------------- main scrape -------------------------
 
 def scrape_short_positions() -> List[ShortPosition]:
-    logger.info("Fetching AFM page: %s", AFM_SHORTPOS_URL)
+    logger.info("Fetching AFM page (bypass_filter=%s): %s", BYPASS_FILTER, AFM_SHORTPOS_URL)
     resp = requests.get(
         AFM_SHORTPOS_URL,
         headers={
             "User-Agent": "Mozilla/5.0 (compatible; PennywatchScraper/1.0)",
             "Accept-Language": "nl,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml",
         },
         timeout=30,
     )
@@ -288,20 +357,28 @@ def scrape_short_positions() -> List[ShortPosition]:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # 1) Try HTML table first
-    table = _find_table(soup)
-    if table:
-        items = _parse_rows_from_table(table)
+    # 1) HTML table
+    tbl = _pick_best_table(soup)
+    if tbl:
+        items = _parse_from_table(tbl)
         if items:
             return items
 
-    logger.info("No items from HTML table, trying CSV fallback…")
-    csv_url = _try_csv_from_page(soup)
+    # 2) CSV fallback
+    logger.info("HTML path produced 0 items; trying CSV fallback…")
+    csv_url = _find_download_link(soup)
     if csv_url:
+        logger.info("Attempting CSV download: %s", csv_url)
         try:
-            csv_resp = requests.get(csv_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            csv_resp = requests.get(
+                csv_url,
+                timeout=30,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; PennywatchScraper/1.0)"},
+            )
             csv_resp.raise_for_status()
-            items = _parse_csv(csv_resp.text)
+            # decode with best guess
+            text = csv_resp.content.decode("utf-8", errors="ignore")
+            items = _parse_csv(text)
             if items:
                 return items
         except Exception as e:
