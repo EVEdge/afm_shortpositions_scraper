@@ -11,5 +11,5 @@ AFM_URL = os.getenv(
 
 DATABASE_URL   = os.getenv("DATABASE_URL", "sqlite:///afm.db")
 CATEGORY_ID    = int(os.getenv("WP_CATEGORY_ID", "777"))
-PUBLISH_STATUS = os.getenv("WP_PUBLISH_STATUS", "publish")  # ← default to draft
+PUBLISH_STATUS = os.getenv("WP_PUBLISH_STATUS", "draft")  # ← default to draft
 MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "10"))
