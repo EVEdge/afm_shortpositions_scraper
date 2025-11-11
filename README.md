@@ -1,0 +1,2 @@
+# afm_shortpositions_scraper
+Shortpositions scraper
