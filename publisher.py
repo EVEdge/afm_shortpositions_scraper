@@ -10,9 +10,9 @@ WP_BASE_URL        = os.getenv("WP_BASE_URL", "").rstrip("/")
 WP_USERNAME        = os.getenv("WP_USERNAME")
 WP_APP_PASSWORD    = os.getenv("WP_APP_PASSWORD")
 
-# Default to your requested settings
+# Defaults per your workflow
 WP_CATEGORY_ID     = int(os.getenv("WP_CATEGORY_ID", "777") or 777)
-WP_PUBLISH_STATUS  = os.getenv("WP_PUBLISH_STATUS", "draft")  # ← draft by default
+WP_PUBLISH_STATUS  = os.getenv("WP_PUBLISH_STATUS", "draft")  # post as draft
 MAX_POSTS_PER_RUN  = int(os.getenv("MAX_POSTS_PER_RUN", "10"))
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,9 @@ def _posts_url() -> str:
 
 def _tags_url() -> str:
     return _api("tags")
+
+def _post_url(post_id: int) -> str:
+    return _api(f"posts/{post_id}")
 
 # cache tag name -> id per run
 _TAG_CACHE: dict[str, int] = {}
@@ -147,11 +150,68 @@ def _normalize_tags(payload: Dict) -> None:
     else:
         payload.pop("tags", None)
 
+# ----------------- Duplicate protection -----------------
+
+_UID_PREFIX = "PW-AFM-UID:"
+
+def _extract_uid(payload: Dict) -> Optional[str]:
+    meta_uid = (payload.get("meta") or {}).get("afm_unique_id")
+    return (str(meta_uid).strip() or None) if meta_uid else None
+
+def _embed_uid_marker(payload: Dict, uid: str) -> None:
+    """
+    Append an invisible unique marker to the content so we can detect duplicates
+    via WP search API. We include both an HTML comment and a hidden span.
+    """
+    marker_comment = f"<!--{_UID_PREFIX}{uid}-->"
+    marker_span    = f'<span style="display:none">{_UID_PREFIX}{uid}</span>'
+    content = payload.get("content") or ""
+    payload["content"] = (content + "\n" + marker_comment + "\n" + marker_span).strip()
+
+def _post_exists_by_uid(uid: str) -> bool:
+    """
+    Search WP posts for our unique marker. We fetch a few results and verify
+    marker presence in the content to avoid false positives.
+    """
+    try:
+        resp = requests.get(
+            _posts_url(),
+            auth=_auth(),
+            params={"search": _UID_PREFIX + uid, "per_page": 5, "status": "any"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+        if isinstance(results, list) and results:
+            # Optional hard check: fetch the first few posts' content to confirm marker
+            for post in results:
+                pid = int(post.get("id"))
+                detail = requests.get(_post_url(pid), auth=_auth(), timeout=30)
+                if detail.status_code == 200:
+                    content = (detail.json().get("content", {}) or {}).get("rendered", "") or ""
+                    if (_UID_PREFIX + uid) in content:
+                        return True
+        return False
+    except Exception as e:
+        logger.warning("UID duplicate check failed for %s: %s", uid, e)
+        # Fail-open: if we can't check, we won't block posting
+        return False
+
+# ----------------- Core posting -----------------
+
 def _post_to_wordpress(payload: Dict) -> Dict:
     _ensure_categories(payload)
     _normalize_tags(payload)
-    # Always enforce draft unless explicitly overridden upstream
     payload.setdefault("status", WP_PUBLISH_STATUS)
+
+    # Duplicate protection
+    uid = _extract_uid(payload)
+    if uid:
+        _embed_uid_marker(payload, uid)
+        if _post_exists_by_uid(uid):
+            logger.info("Duplicate detected; skipping post for uid=%s", uid)
+            return {"skipped": True, "reason": "duplicate", "uid": uid}
+
     resp = requests.post(
         _posts_url(),
         auth=_auth(),
@@ -174,10 +234,14 @@ def publish_items(items: List[Dict]) -> int:
 
         payload = build_article(item, category_id=WP_CATEGORY_ID)
         payload.setdefault("status", WP_PUBLISH_STATUS)  # draft
+
         try:
-            _post_to_wordpress(payload)
-            created += 1
-            time.sleep(0.3)
+            res = _post_to_wordpress(payload)
+            if isinstance(res, dict) and res.get("skipped"):
+                logger.info("Skipped duplicate (uid=%s).", res.get("uid"))
+            else:
+                created += 1
+                time.sleep(0.3)
         except Exception as e:
             logger.error("Failed to publish item (afm_key=%s): %s", item.get("afm_key") or item.get("unique_id"), e)
     logger.info("Published %d items.", created)
@@ -192,7 +256,10 @@ def publish_to_wordpress(arg: Union[Dict, List[Dict]]) -> int:
         payload = dict(arg)
         payload.setdefault("status", WP_PUBLISH_STATUS)  # draft
         try:
-            _post_to_wordpress(payload)
+            res = _post_to_wordpress(payload)
+            if isinstance(res, dict) and res.get("skipped"):
+                logger.info("Skipped duplicate (uid=%s).", res.get("uid"))
+                return 0
             logger.info("Published 1 item (single payload).")
             return 1
         except Exception as e:
