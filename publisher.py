@@ -10,9 +10,9 @@ WP_BASE_URL        = os.getenv("WP_BASE_URL", "").rstrip("/")
 WP_USERNAME        = os.getenv("WP_USERNAME")
 WP_APP_PASSWORD    = os.getenv("WP_APP_PASSWORD")
 
-# Defaults per your workflow
+# Defaults — publish directly, keep category 777
 WP_CATEGORY_ID     = int(os.getenv("WP_CATEGORY_ID", "777") or 777)
-WP_PUBLISH_STATUS  = os.getenv("WP_PUBLISH_STATUS", "draft")  # post as draft
+WP_PUBLISH_STATUS  = os.getenv("WP_PUBLISH_STATUS", "publish")  # ← publish directly
 MAX_POSTS_PER_RUN  = int(os.getenv("MAX_POSTS_PER_RUN", "10"))
 
 logger = logging.getLogger(__name__)
@@ -183,7 +183,6 @@ def _post_exists_by_uid(uid: str) -> bool:
         resp.raise_for_status()
         results = resp.json()
         if isinstance(results, list) and results:
-            # Optional hard check: fetch the first few posts' content to confirm marker
             for post in results:
                 pid = int(post.get("id"))
                 detail = requests.get(_post_url(pid), auth=_auth(), timeout=30)
@@ -202,7 +201,7 @@ def _post_exists_by_uid(uid: str) -> bool:
 def _post_to_wordpress(payload: Dict) -> Dict:
     _ensure_categories(payload)
     _normalize_tags(payload)
-    payload.setdefault("status", WP_PUBLISH_STATUS)
+    payload.setdefault("status", WP_PUBLISH_STATUS)  # publish
 
     # Duplicate protection
     uid = _extract_uid(payload)
@@ -233,7 +232,7 @@ def publish_items(items: List[Dict]) -> int:
             break
 
         payload = build_article(item, category_id=WP_CATEGORY_ID)
-        payload.setdefault("status", WP_PUBLISH_STATUS)  # draft
+        payload.setdefault("status", WP_PUBLISH_STATUS)  # publish
 
         try:
             res = _post_to_wordpress(payload)
@@ -254,7 +253,7 @@ def publish_to_wordpress(arg: Union[Dict, List[Dict]]) -> int:
     """
     if isinstance(arg, dict):
         payload = dict(arg)
-        payload.setdefault("status", WP_PUBLISH_STATUS)  # draft
+        payload.setdefault("status", WP_PUBLISH_STATUS)  # publish
         try:
             res = _post_to_wordpress(payload)
             if isinstance(res, dict) and res.get("skipped"):
