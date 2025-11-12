@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 AFM_SOURCE_LABEL = "klik hier"
 AFM_SOURCE_URL_FALLBACK = "https://www.afm.nl/nl-nl/sector/registers/meldingenregisters/netto-shortposities-actueel"
@@ -6,8 +6,7 @@ AFM_SOURCE_URL_FALLBACK = "https://www.afm.nl/nl-nl/sector/registers/meldingenre
 def _pct_nl(num: Optional[float], fallback: str = "") -> str:
     """
     Format percentage with Dutch comma separator.
-    - If num is provided: '1,20%'
-    - Else use fallback string as-is (and ensure it ends with %)
+    Always two decimals.
     """
     if num is not None:
         try:
@@ -17,26 +16,17 @@ def _pct_nl(num: Optional[float], fallback: str = "") -> str:
     s = (fallback or "").strip()
     if not s:
         return ""
+    # normalize to comma and ensure it ends with %
     s = s.replace(".", ",")
     return s if s.endswith("%") else s + "%"
 
-def _one_decimal(pct_str: str) -> str:
-    try:
-        raw = pct_str.replace("%", "").replace(",", ".")
-        return f"{float(raw):.1f}%".replace(".", ",")
-    except Exception:
-        return pct_str
-
-def _nl_title(issuer: str, short_seller: str, pct_str: str, direction: Optional[str]) -> str:
-    # increased -> "vergroot shortpositie (1,2%)"
-    # decreased -> "verkleint shortpositie (1,2%)"
-    # none      -> "meldt 1,2% shortpositie"
-    pct_one = _one_decimal(pct_str)
+def _nl_title(issuer: str, short_seller: str, pct_str_two: str, direction: Optional[str]) -> str:
+    # pct_str_two is already two decimals with comma
     if direction == "up":
-        return f"{short_seller} vergroot shortpositie ({pct_one}) in {issuer}."
+        return f"{short_seller} vergroot shortpositie ({pct_str_two}) in {issuer}."
     if direction == "down":
-        return f"{short_seller} verkleint shortpositie ({pct_one}) in {issuer}."
-    return f"{short_seller} meldt {pct_one} shortpositie in {issuer}."
+        return f"{short_seller} verkleint shortpositie ({pct_str_two}) in {issuer}."
+    return f"{short_seller} meldt {pct_str_two} shortpositie in {issuer}."
 
 def _excerpt_nl(issuer: str, short_seller: str, pct_str: str, date_iso: str, prev_str: Optional[str], direction: Optional[str]) -> str:
     if prev_str:
@@ -55,6 +45,22 @@ def _excerpt_nl(issuer: str, short_seller: str, pct_str: str, date_iso: str, pre
         f"Gebaseerd op het actuele AFM-register{(' (datum: ' + date_iso + ')') if date_iso else ''}."
     )
 
+def _history_table(history: List[Dict]) -> str:
+    """
+    Build a simple HTML table with columns: Datum, Positie (max 10 rows).
+    History is expected most recent first.
+    """
+    if not history:
+        return ""
+    rows = []
+    rows.append('<table><thead><tr><th>Datum</th><th>Positie</th></tr></thead><tbody>')
+    for h in history[:10]:
+        date = h.get("date", "")
+        pct  = h.get("pct") or _pct_nl(h.get("pct_num"))
+        rows.append(f"<tr><td>{date}</td><td>{pct}</td></tr>")
+    rows.append("</tbody></table>")
+    return "\n".join(rows)
+
 def _content_nl(item: Dict) -> str:
     issuer        = item.get("issuer") or item.get("emittent") or ""
     isin          = item.get("issuer_isin") or ""
@@ -68,26 +74,32 @@ def _content_nl(item: Dict) -> str:
     prev_num      = item.get("prev_net_short_pct_num")
     prev_raw      = item.get("prev_net_short_pct") or ""
     prev_str      = _pct_nl(prev_num, prev_raw) if prev_num is not None else None
+    history       = item.get("history") or []
 
     parts: list[str] = []
     parts.append("<h3>Overzicht van shortpositie</h3>")
     parts.append("<ul>")
     parts.append(f"<li><strong>Aandeel:</strong> {issuer}</li>")
     parts.append(f"<li><strong>Short seller:</strong> {short_seller}</li>")
-    if date_iso:
-        parts.append(f"<li><strong>Meldingsdatum:</strong> {date_iso}</li>")
-
+    # Removed the first 'Meldingsdatum' as requested
     # Positie + vorige (if available)
     if prev_str:
         parts.append(f"<li><strong>Positie:</strong> {pct_str} (vorige: {prev_str})</li>")
     else:
         parts.append(f"<li><strong>Positie:</strong> {pct_str}</li>")
-
     if isin:
         parts.append(f"<li><strong>ISIN:</strong> {isin}</li>")
     if date_iso:
         parts.append(f"<li><strong>Meldingsdatum:</strong> {date_iso}</li>")
     parts.append("</ul>")
+
+    # New section: Eerdere meldingen (with table)
+    parts.append("<h3>Eerdere meldingen</h3>")
+    table_html = _history_table(history)
+    if table_html:
+        parts.append(table_html)
+    else:
+        parts.append("<p>Geen eerdere meldingen gevonden.</p>")
 
     parts.append("<h3>Disclaimer</h3>")
     parts.append(
@@ -106,7 +118,7 @@ def build_article(item: Dict, *, category_id: int | None = None) -> Dict:
     short_seller  = item.get("short_seller") or item.get("melder") or ""
     pct_num       = item.get("net_short_pct_num")
     pct_raw       = item.get("net_short_pct") or ""
-    pct_str       = _pct_nl(pct_num, pct_raw)
+    pct_str       = _pct_nl(pct_num, pct_raw)  # two decimals
     date_iso      = item.get("position_date_iso") or item.get("position_date") or item.get("meldingsdatum") or ""
 
     prev_num      = item.get("prev_net_short_pct_num")
@@ -129,7 +141,6 @@ def build_article(item: Dict, *, category_id: int | None = None) -> Dict:
             "afm_unique_id": item.get("unique_id") or item.get("afm_key"),
             "afm_date": date_iso,
             "type": "shortpositie",
-            # Optional: store direction & prev in meta too
             "prev_pct": prev_str,
             "direction": direction,
         },
