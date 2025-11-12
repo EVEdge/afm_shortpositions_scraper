@@ -1,12 +1,12 @@
 from typing import Dict, Optional, List
+from datetime import datetime
 
 AFM_SOURCE_LABEL = "klik hier"
 AFM_SOURCE_URL_FALLBACK = "https://www.afm.nl/nl-nl/sector/registers/meldingenregisters/netto-shortposities-actueel"
 
 def _pct_nl(num: Optional[float], fallback: str = "") -> str:
     """
-    Format percentage with Dutch comma separator.
-    Always two decimals.
+    Format percentage with Dutch comma separator (two decimals).
     """
     if num is not None:
         try:
@@ -16,9 +16,32 @@ def _pct_nl(num: Optional[float], fallback: str = "") -> str:
     s = (fallback or "").strip()
     if not s:
         return ""
-    # normalize to comma and ensure it ends with %
     s = s.replace(".", ",")
     return s if s.endswith("%") else s + "%"
+
+def _fmt_date_nl(iso: str | None) -> str:
+    """
+    Convert 'YYYY-MM-DD' to 'D-M-YYYY' (e.g., 2025-11-07 -> 7-11-2025).
+    Returns the input if parsing fails or input is empty.
+    """
+    if not iso:
+        return ""
+    txt = str(iso).strip()
+    # Accept YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
+        try:
+            d = datetime.strptime(txt, fmt)
+            return f"{d.day}-{d.month}-{d.year}"
+        except ValueError:
+            continue
+    # Try DD-MM-YYYY (already NL)
+    for fmt in ("%d-%m-%Y",):
+        try:
+            d = datetime.strptime(txt, fmt)
+            return f"{d.day}-{d.month}-{d.year}"
+        except ValueError:
+            continue
+    return txt
 
 def _nl_title(issuer: str, short_seller: str, pct_str_two: str, direction: Optional[str]) -> str:
     # pct_str_two is already two decimals with comma
@@ -29,6 +52,7 @@ def _nl_title(issuer: str, short_seller: str, pct_str_two: str, direction: Optio
     return f"{short_seller} meldt {pct_str_two} shortpositie in {issuer}."
 
 def _excerpt_nl(issuer: str, short_seller: str, pct_str: str, date_iso: str, prev_str: Optional[str], direction: Optional[str]) -> str:
+    dnl = _fmt_date_nl(date_iso)
     if prev_str:
         if direction == "up":
             trend = " Deze positie is verhoogd ten opzichte van de vorige melding."
@@ -38,11 +62,11 @@ def _excerpt_nl(issuer: str, short_seller: str, pct_str: str, date_iso: str, pre
             trend = ""
         return (
             f"{short_seller} heeft een netto shortpositie van {pct_str} in {issuer}. "
-            f"Vorige positie: {prev_str}. {('Datum: ' + date_iso) if date_iso else ''}{trend}"
+            f"Vorige positie: {prev_str}. {('Datum: ' + dnl) if dnl else ''}{trend}"
         )
     return (
         f"{short_seller} heeft een netto shortpositie van {pct_str} in {issuer}. "
-        f"Gebaseerd op het actuele AFM-register{(' (datum: ' + date_iso + ')') if date_iso else ''}."
+        f"Gebaseerd op het actuele AFM-register{(' (datum: ' + dnl + ')') if dnl else ''}."
     )
 
 def _history_table(history: List[Dict]) -> str:
@@ -55,9 +79,10 @@ def _history_table(history: List[Dict]) -> str:
     rows = []
     rows.append('<table><thead><tr><th>Datum</th><th>Positie</th></tr></thead><tbody>')
     for h in history[:10]:
-        date = h.get("date", "")
+        date_iso = h.get("date", "")
+        date_nl = _fmt_date_nl(date_iso)
         pct  = h.get("pct") or _pct_nl(h.get("pct_num"))
-        rows.append(f"<tr><td>{date}</td><td>{pct}</td></tr>")
+        rows.append(f"<tr><td>{date_nl}</td><td>{pct}</td></tr>")
     rows.append("</tbody></table>")
     return "\n".join(rows)
 
@@ -69,6 +94,7 @@ def _content_nl(item: Dict) -> str:
     pct_raw       = item.get("net_short_pct") or ""
     pct_str       = _pct_nl(pct_num, pct_raw)
     date_iso      = item.get("position_date_iso") or item.get("position_date") or item.get("meldingsdatum") or ""
+    date_nl       = _fmt_date_nl(date_iso)
     source_url    = item.get("source_url") or AFM_SOURCE_URL_FALLBACK
 
     prev_num      = item.get("prev_net_short_pct_num")
@@ -81,16 +107,15 @@ def _content_nl(item: Dict) -> str:
     parts.append("<ul>")
     parts.append(f"<li><strong>Aandeel:</strong> {issuer}</li>")
     parts.append(f"<li><strong>Short seller:</strong> {short_seller}</li>")
-    # Removed the first 'Meldingsdatum' as requested
-    # Positie + vorige (if available)
+    # Only one Meldingsdatum (requested)
     if prev_str:
         parts.append(f"<li><strong>Positie:</strong> {pct_str} (vorige: {prev_str})</li>")
     else:
         parts.append(f"<li><strong>Positie:</strong> {pct_str}</li>")
     if isin:
         parts.append(f"<li><strong>ISIN:</strong> {isin}</li>")
-    if date_iso:
-        parts.append(f"<li><strong>Meldingsdatum:</strong> {date_iso}</li>")
+    if date_nl:
+        parts.append(f"<li><strong>Meldingsdatum:</strong> {date_nl}</li>")
     parts.append("</ul>")
 
     # New section: Eerdere meldingen (with table)
@@ -110,6 +135,12 @@ def _content_nl(item: Dict) -> str:
         "Pennywatch.nl is niet gelieerd aan de Autoriteit Financiële Markten (AFM). "
         "Pennywatch.nl geeft geen garanties over de juistheid of volledigheid van de informatie.</em></p>"
     )
+
+    # Invisible unique marker (also added again by publisher before posting)
+    uid = (item.get("unique_id") or item.get("afm_key") or "").strip()
+    if uid:
+        parts.append(f"<!--PW-AFM-UID:{uid}-->")
+        parts.append(f'<span style="display:none">PW-AFM-UID:{uid}</span>')
 
     return "\n".join(parts)
 
@@ -132,14 +163,13 @@ def build_article(item: Dict, *, category_id: int | None = None) -> Dict:
 
     payload: Dict = {
         "title": title,
-        # Publisher will set status/category (draft / 777)
         "excerpt": excerpt,
         "content": content,
         # Tags as names — publisher resolves/creates IDs
         "tags": list(filter(None, {issuer, short_seller})),
         "meta": {
             "afm_unique_id": item.get("unique_id") or item.get("afm_key"),
-            "afm_date": date_iso,
+            "afm_date": _fmt_date_nl(date_iso),
             "type": "shortpositie",
             "prev_pct": prev_str,
             "direction": direction,
