@@ -9,8 +9,10 @@ from article_builder import build_article
 WP_BASE_URL        = os.getenv("WP_BASE_URL", "").rstrip("/")
 WP_USERNAME        = os.getenv("WP_USERNAME")
 WP_APP_PASSWORD    = os.getenv("WP_APP_PASSWORD")
-WP_CATEGORY_ID     = int(os.getenv("WP_CATEGORY_ID", "0") or 0)
-WP_PUBLISH_STATUS  = os.getenv("WP_PUBLISH_STATUS", "publish")
+
+# Default to your requested settings
+WP_CATEGORY_ID     = int(os.getenv("WP_CATEGORY_ID", "777") or 777)
+WP_PUBLISH_STATUS  = os.getenv("WP_PUBLISH_STATUS", "draft")  # ← draft by default
 MAX_POSTS_PER_RUN  = int(os.getenv("MAX_POSTS_PER_RUN", "10"))
 
 logger = logging.getLogger(__name__)
@@ -43,11 +45,9 @@ _TAG_CACHE: dict[str, int] = {}
 
 def _sanitize_tag_name(name: str) -> str:
     s = str(name).strip()
-    # soften problematic punctuation for slugs like "D. E. Shaw & Co., L.P."
     s = s.replace("&", "and")
     for ch in [",", ".", ";", ":", "’", "'", '"', "(", ")", "[", "]", "{", "}", "/", "\\"]:
         s = s.replace(ch, " ")
-    # collapse spaces and trim to a safe WP limit
     s = " ".join(s.split())[:190]
     return s or "tag"
 
@@ -59,7 +59,7 @@ def _get_or_create_tag_id(name: str) -> Optional[int]:
     if key in _TAG_CACHE:
         return _TAG_CACHE[key]
 
-    # 1) try search (exact match, case-insensitive)
+    # 1) try search (exact match)
     try:
         resp = requests.get(
             _tags_url(),
@@ -85,7 +85,7 @@ def _get_or_create_tag_id(name: str) -> Optional[int]:
         )
         if r.status_code == 201:
             return int(r.json()["id"])
-        # Handle common WP error: term already exists
+        # WP commonly returns term_exists
         try:
             data = r.json()
             if isinstance(data, dict) and data.get("code") == "term_exists":
@@ -94,13 +94,13 @@ def _get_or_create_tag_id(name: str) -> Optional[int]:
             pass
         return None
 
-    # 2) try create with original name
+    # 2) create original
     tid = _post_tag(name)
     if tid:
         _TAG_CACHE[key] = tid
         return tid
 
-    # 3) sanitize and retry once
+    # 3) sanitize + retry
     clean = _sanitize_tag_name(name)
     if clean != name:
         tid = _post_tag(clean)
@@ -112,16 +112,13 @@ def _get_or_create_tag_id(name: str) -> Optional[int]:
     return None
 
 def _ensure_categories(payload: Dict) -> None:
+    # Always enforce category 777 by default (can still be overridden via env)
     if WP_CATEGORY_ID:
         payload["categories"] = [WP_CATEGORY_ID]
 
 def _normalize_tags(payload: Dict) -> None:
     """
     Convert payload['tags'] (names or IDs) into a proper ID list for WP REST.
-    Supports:
-      - list[str] of names  -> resolve to IDs (create if needed)
-      - list[int] already   -> pass through
-      - missing/empty       -> remove
     """
     if "tags" not in payload or payload["tags"] is None:
         return
@@ -148,12 +145,13 @@ def _normalize_tags(payload: Dict) -> None:
     if ids:
         payload["tags"] = ids
     else:
-        # nothing resolved — drop the field to avoid WP 400
         payload.pop("tags", None)
 
 def _post_to_wordpress(payload: Dict) -> Dict:
     _ensure_categories(payload)
     _normalize_tags(payload)
+    # Always enforce draft unless explicitly overridden upstream
+    payload.setdefault("status", WP_PUBLISH_STATUS)
     resp = requests.post(
         _posts_url(),
         auth=_auth(),
@@ -175,7 +173,7 @@ def publish_items(items: List[Dict]) -> int:
             break
 
         payload = build_article(item, category_id=WP_CATEGORY_ID)
-        payload.setdefault("status", WP_PUBLISH_STATUS)
+        payload.setdefault("status", WP_PUBLISH_STATUS)  # draft
         try:
             _post_to_wordpress(payload)
             created += 1
@@ -192,7 +190,7 @@ def publish_to_wordpress(arg: Union[Dict, List[Dict]]) -> int:
     """
     if isinstance(arg, dict):
         payload = dict(arg)
-        payload.setdefault("status", WP_PUBLISH_STATUS)
+        payload.setdefault("status", WP_PUBLISH_STATUS)  # draft
         try:
             _post_to_wordpress(payload)
             logger.info("Published 1 item (single payload).")
