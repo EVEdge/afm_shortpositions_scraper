@@ -1,13 +1,12 @@
-# afm_scraper.py
-
 import csv
 import io
 import logging
 import re
 import hashlib
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, DefaultDict
+from collections import defaultdict
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,6 +19,15 @@ if not logger.handlers:
     h.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
+
+# ---------- CSV headers currently used by AFM ----------
+COL_HOLDER = "Positie houder"            # short seller
+COL_ISSUER = "Naam van de emittent"      # issuer
+COL_ISIN   = "ISIN"
+COL_PCT    = "Netto Shortpositie"        # numeric, no % sign
+COL_DATE   = "Positiedatum"              # e.g. 2025-11-07 00:00:00
+
+DATE_RE = re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})|(\d{2})[-/](\d{2})[-/](\d{4})")
 
 
 @dataclass
@@ -34,31 +42,38 @@ class ShortPosition:
     source_url: str
     unique_id: str
 
+    # newly added, filled after grouping
+    prev_net_short_pct: Optional[str] = None
+    prev_net_short_pct_num: Optional[float] = None
+    prev_position_date_iso: Optional[str] = None
+    direction: Optional[str] = None  # "up" | "down" | None
+
     def to_dict(self) -> Dict:
         d = asdict(self)
-        # ---- Backward-compat for the old "meldingen" pipeline ----
-        d["melder"] = self.short_seller           # old field name for holder
-        d["emittent"] = self.issuer               # old field name for issuer
-        d["afm_key"] = self.unique_id             # stable key for DB/dedupe
-        # These two fields prevent "n.n.b." skip logic:
-        d["kapitaalbelang"] = self.net_short_pct_num              # numeric %
+        # legacy aliases so old code NEVER skips and can tag/dedupe
+        d["melder"] = self.short_seller
+        d["emittent"] = self.issuer
+        d["afm_key"] = self.unique_id
+        d["kapitaalbelang"] = self.net_short_pct_num
         d["kapitaalbelang_str"] = self.net_short_pct or f"{self.net_short_pct_num:.2f}%"
-        # Optional: type tag if you branch on it somewhere
         d["meldingstype"] = "shortpositie"
+
+        # expose "previous" info in dict
+        if self.prev_net_short_pct_num is not None:
+            d["prev_net_short_pct_num"] = self.prev_net_short_pct_num
+            d["prev_net_short_pct"] = self.prev_net_short_pct
+            d["prev_position_date_iso"] = self.prev_position_date_iso
+            d["direction"] = self.direction
         return d
 
 
 # ---------- helpers ----------
 
-DATE_RE = re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})|(\d{2})[-/](\d{2})[-/](\d{4})")
-
 def _clean(x: str) -> str:
     return re.sub(r"\s+", " ", (x or "").strip())
 
 def _pct_to_float(p: str) -> float:
-    if p is None:
-        return 0.0
-    s = str(p).replace("%", "").replace(",", ".").strip()
+    s = str(p or "").replace("%", "").replace(",", ".").strip()
     m = re.search(r"(\d+(?:\.\d+)?)", s)
     return float(m.group(1)) if m else 0.0
 
@@ -130,21 +145,14 @@ def _find_csv_url() -> Optional[str]:
     return None
 
 
-# ---------- CSV parsing (matches your uploaded file) ----------
-
-COL_HOLDER = "Positie houder"
-COL_ISSUER = "Naam van de emittent"
-COL_ISIN   = "ISIN"
-COL_PCT    = "Netto Shortpositie"      # numeric, no % sign
-COL_DATE   = "Positiedatum"            # e.g. 2025-11-07 00:00:00
+# ---------- parsing & grouping ----------
 
 def _parse_csv_rows(text: str) -> List[ShortPosition]:
     delim = _sniff_delimiter(text)
     reader = csv.DictReader(io.StringIO(text), delimiter=delim)
 
-    out: List[ShortPosition] = []
+    rows: List[ShortPosition] = []
     seen = 0
-
     for row in reader:
         seen += 1
         issuer = _clean(row.get(COL_ISSUER, ""))
@@ -152,7 +160,6 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
         isin   = _clean(row.get(COL_ISIN, "")) or None
         pct_raw = _clean(str(row.get(COL_PCT, "")))
         date_raw = _clean(str(row.get(COL_DATE, "")))
-
         if not issuer or not holder or not pct_raw:
             continue
 
@@ -160,7 +167,7 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
         date_raw, iso = _parse_date(date_raw)
         uid = _uid(issuer, holder, iso, pct_raw)
 
-        out.append(
+        rows.append(
             ShortPosition(
                 issuer=issuer,
                 issuer_isin=isin,
@@ -174,8 +181,40 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
             )
         )
 
-    logger.info("Parsed CSV rows: seen=%d, kept=%d", seen, len(out))
-    return out
+    logger.info("Parsed CSV rows: seen=%d, kept=%d", seen, len(rows))
+    return rows
+
+
+def _attach_previous(rows: List[ShortPosition]) -> List[ShortPosition]:
+    """
+    For each (issuer, short_seller) group, sort by date and keep only the latest item,
+    but attach the most recent previous position (if any) to that latest item.
+    """
+    groups: DefaultDict[Tuple[str, str], List[ShortPosition]] = defaultdict(list)
+    for sp in rows:
+        groups[(sp.issuer, sp.short_seller)].append(sp)
+
+    output: List[ShortPosition] = []
+    for key, items in groups.items():
+        # sort by date ascending (older -> newer)
+        items.sort(key=lambda x: (x.position_date_iso or "", x.net_short_pct_num or 0.0))
+        latest = items[-1]
+        prev = items[-2] if len(items) >= 2 else None
+
+        if prev:
+            latest.prev_net_short_pct_num = prev.net_short_pct_num
+            latest.prev_net_short_pct = prev.net_short_pct
+            latest.prev_position_date_iso = prev.position_date_iso
+            if latest.net_short_pct_num > prev.net_short_pct_num:
+                latest.direction = "up"
+            elif latest.net_short_pct_num < prev.net_short_pct_num:
+                latest.direction = "down"
+            else:
+                latest.direction = None
+
+        output.append(latest)
+
+    return output
 
 
 # ---------- public scrape ----------
@@ -194,10 +233,9 @@ def scrape_short_positions() -> List[ShortPosition]:
     resp.raise_for_status()
     text = _decode_best(resp.content)
 
-    items = _parse_csv_rows(text)
-    if not items:
-        logger.warning("AFM short positions: found 0 items (empty CSV parse).")
-    return items
+    all_rows = _parse_csv_rows(text)
+    latest_with_prev = _attach_previous(all_rows)
+    return latest_with_prev
 
 
 # ---------- compatibility for your main.py ----------
