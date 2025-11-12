@@ -25,6 +25,7 @@ WHITELIST = {
     "Koninklijke BAM Groep N.V.",
     "Koninklijke Heijmans N.V.",
     "Wereldhave N.V.",
+    "Alfen N.V.",
     "Pharming Group N.V.",
     "Acomo N.V.",
     "Nedap N.V.",
