@@ -20,6 +20,62 @@ if not logger.handlers:
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
 
+# ---------------- Whitelist (exact names) ----------------
+WHITELIST = {
+    "Koninklijke BAM Groep N.V.",
+    "Koninklijke Heijmans N.V.",
+    "Wereldhave N.V.",
+    "Pharming Group N.V.",
+    "Acomo N.V.",
+    "Nedap N.V.",
+    "TomTom N.V.",
+    "B&S Group S.A.",
+    "PostNL N.V.",
+    "Fastned B.V.",
+    "Sligro Food Group N.V.",
+    "Brunel International N.V.",
+    "NSI N.V.",
+    "ForFarmers N.V.",
+    "Kendrion N.V.",
+    "Sif Holding N.V.",
+    "Accsys Technologies PLC",
+    "NX Filtration N.V.",
+    "Azerion Group N.V.",
+    "CM.com N.V.",
+    "Avantium N.V.",
+    "Vivoryon Therapeutics N.V.",
+    "Ebusco Holding N.V.",
+    "Tetragon Financial Group Limited",
+    "Retail Estates N.V.",
+    "Envipco Holding N.V.",
+    "Volta Finance Limited",
+    "Hydratec Industries N.V.",
+    "MotorK PLC",
+    "AFC Ajax N.V.",
+    "SPEAR Investments I B.V.",
+    "The London Tunnels PLC",
+    "Holland Colours N.V.",
+    "Value8 N.V.",
+    "Bever Holding N.V.",
+    "Cabka N.V.",
+    "Morefield Group N.V.",
+    "Ctac N.V.",
+    "New Amsterdam Invest N.V.",
+    "Alumexx N.V.",
+    "MKB Nedsense N.V.",
+    "PB Holding N.V.",
+    "Eurocastle Investment Limited",
+    "Ease2pay N.V.",
+    "B.V. Delftsch Aardewerkfabriek “De Porceleyne Fles Anno 1653”",
+    'B.V. Delftsch Aardewerkfabriek "De Porceleyne Fles Anno 1653"',  # straight quotes variant
+    "Green Earth Group N.V.",
+    "Lavide Holding N.V.",
+    "New Sources Energy N.V.",
+    "Titan N.V.",
+    "Almunda Professionals N.V.",
+    "Agility Capital Holding Inc.",
+}
+
 # ---------- CSV headers currently used by AFM ----------
 COL_HOLDER = "Positie houder"            # short seller
 COL_ISSUER = "Naam van de emittent"      # issuer
@@ -48,7 +104,7 @@ class ShortPosition:
     prev_position_date_iso: Optional[str] = None
     direction: Optional[str] = None  # "up" | "down" | None
 
-    # NEW: full previous history (most recent first, up to 10)
+    # full previous history (most recent first, up to 10)
     history: List[Dict] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
@@ -180,6 +236,10 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
         if not issuer or not holder or not pct_raw:
             continue
 
+        # ---------------- Whitelist filter ----------------
+        if issuer not in WHITELIST:
+            continue
+
         pct_num = _pct_to_float(pct_raw)
         date_raw, iso = _parse_date(date_raw)
         uid = _uid(issuer, holder, iso, pct_raw)
@@ -198,7 +258,7 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
             )
         )
 
-    logger.info("Parsed CSV rows: seen=%d, kept=%d", seen, len(rows))
+    logger.info("Parsed CSV rows: seen=%d, kept=%d (after whitelist)", seen, len(rows))
     return rows
 
 
