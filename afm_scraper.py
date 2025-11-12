@@ -42,11 +42,14 @@ class ShortPosition:
     source_url: str
     unique_id: str
 
-    # newly added, filled after grouping
+    # previously added fields
     prev_net_short_pct: Optional[str] = None
     prev_net_short_pct_num: Optional[float] = None
     prev_position_date_iso: Optional[str] = None
     direction: Optional[str] = None  # "up" | "down" | None
+
+    # NEW: full previous history (most recent first, up to 10)
+    history: List[Dict] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         d = asdict(self)
@@ -58,12 +61,14 @@ class ShortPosition:
         d["kapitaalbelang_str"] = self.net_short_pct or f"{self.net_short_pct_num:.2f}%"
         d["meldingstype"] = "shortpositie"
 
-        # expose "previous" info in dict
+        # expose "previous" info & history
         if self.prev_net_short_pct_num is not None:
             d["prev_net_short_pct_num"] = self.prev_net_short_pct_num
             d["prev_net_short_pct"] = self.prev_net_short_pct
             d["prev_position_date_iso"] = self.prev_position_date_iso
             d["direction"] = self.direction
+        if self.history:
+            d["history"] = self.history
         return d
 
 
@@ -76,6 +81,18 @@ def _pct_to_float(p: str) -> float:
     s = str(p or "").replace("%", "").replace(",", ".").strip()
     m = re.search(r"(\d+(?:\.\d+)?)", s)
     return float(m.group(1)) if m else 0.0
+
+def _pct_to_str_two(num: float, fallback: str = "") -> str:
+    if num is not None:
+        try:
+            return f"{float(num):.2f}%".replace(".", ",")
+        except Exception:
+            pass
+    s = (fallback or "").strip()
+    if not s:
+        return ""
+    s = s.replace(".", ",")
+    return s if s.endswith("%") else s + "%"
 
 def _parse_date(d: str) -> Tuple[str, str]:
     raw = _clean(d)
@@ -172,7 +189,7 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
                 issuer=issuer,
                 issuer_isin=isin,
                 short_seller=holder,
-                net_short_pct=pct_raw if "%" in pct_raw else f"{pct_raw}%",
+                net_short_pct=_pct_to_str_two(pct_num, pct_raw),
                 net_short_pct_num=pct_num,
                 position_date=date_raw,
                 position_date_iso=iso,
@@ -189,6 +206,7 @@ def _attach_previous(rows: List[ShortPosition]) -> List[ShortPosition]:
     """
     For each (issuer, short_seller) group, sort by date and keep only the latest item,
     but attach the most recent previous position (if any) to that latest item.
+    Also attach history (up to 10 previous filings, most recent first).
     """
     groups: DefaultDict[Tuple[str, str], List[ShortPosition]] = defaultdict(list)
     for sp in rows:
@@ -199,9 +217,10 @@ def _attach_previous(rows: List[ShortPosition]) -> List[ShortPosition]:
         # sort by date ascending (older -> newer)
         items.sort(key=lambda x: (x.position_date_iso or "", x.net_short_pct_num or 0.0))
         latest = items[-1]
-        prev = items[-2] if len(items) >= 2 else None
+        prev_items = items[:-1]
 
-        if prev:
+        if prev_items:
+            prev = prev_items[-1]
             latest.prev_net_short_pct_num = prev.net_short_pct_num
             latest.prev_net_short_pct = prev.net_short_pct
             latest.prev_position_date_iso = prev.position_date_iso
@@ -211,6 +230,19 @@ def _attach_previous(rows: List[ShortPosition]) -> List[ShortPosition]:
                 latest.direction = "down"
             else:
                 latest.direction = None
+
+            # Build history table: most recent first, limit 10
+            prev_items_sorted_desc = sorted(
+                prev_items, key=lambda x: (x.position_date_iso or "", x.net_short_pct_num or 0.0), reverse=True
+            )
+            history = []
+            for sp in prev_items_sorted_desc[:10]:
+                history.append({
+                    "date": sp.position_date_iso,
+                    "pct_num": sp.net_short_pct_num,
+                    "pct": sp.net_short_pct,  # already two decimals with comma
+                })
+            latest.history = history
 
         output.append(latest)
 
