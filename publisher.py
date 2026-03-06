@@ -14,6 +14,7 @@ WP_APP_PASSWORD    = os.getenv("WP_APP_PASSWORD")
 WP_CATEGORY_ID     = int(os.getenv("WP_CATEGORY_ID", "777") or 777)
 WP_PUBLISH_STATUS  = os.getenv("WP_PUBLISH_STATUS", "publish")  # ← publish directly
 MAX_POSTS_PER_RUN  = int(os.getenv("MAX_POSTS_PER_RUN", "10"))
+WP_FEATURED_MEDIA_ID = int(os.getenv("WP_FEATURED_MEDIA_ID", "187574") or 187574)
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -119,6 +120,11 @@ def _ensure_categories(payload: Dict) -> None:
     if WP_CATEGORY_ID:
         payload["categories"] = [WP_CATEGORY_ID]
 
+def _ensure_featured_media(payload: Dict) -> None:
+    # Set a default featured image unless one is already provided
+    if WP_FEATURED_MEDIA_ID and not payload.get("featured_media"):
+        payload["featured_media"] = WP_FEATURED_MEDIA_ID
+
 def _normalize_tags(payload: Dict) -> None:
     """
     Convert payload['tags'] (names or IDs) into a proper ID list for WP REST.
@@ -200,6 +206,7 @@ def _post_exists_by_uid(uid: str) -> bool:
 
 def _post_to_wordpress(payload: Dict) -> Dict:
     _ensure_categories(payload)
+    _ensure_featured_media(payload)
     _normalize_tags(payload)
     payload.setdefault("status", WP_PUBLISH_STATUS)  # publish
 
