@@ -11,6 +11,8 @@ from collections import defaultdict
 import requests
 from bs4 import BeautifulSoup
 
+from pennywatch_universe import ACTIVE_TICKERS, ticker_for_record
+
 AFM_SHORTPOS_URL = "https://www.afm.nl/nl-nl/sector/registers/meldingenregisters/netto-shortposities-actueel"
 
 logger = logging.getLogger(__name__)
@@ -238,7 +240,7 @@ def _parse_csv_rows(text: str) -> List[ShortPosition]:
             continue
 
         # ---------------- Whitelist filter ----------------
-        if issuer not in WHITELIST:
+        if ticker_for_record({"issuer": issuer}) not in ACTIVE_TICKERS:
             continue
 
         pct_num = _pct_to_float(pct_raw)
@@ -312,6 +314,9 @@ def _attach_previous(rows: List[ShortPosition]) -> List[ShortPosition]:
 
 # ---------- public scrape ----------
 
+_FULL_SHORT_HISTORY: List[ShortPosition] = []
+
+
 def scrape_short_positions() -> List[ShortPosition]:
     csv_url = _find_csv_url()
     if not csv_url:
@@ -327,6 +332,10 @@ def scrape_short_positions() -> List[ShortPosition]:
     text = _decode_best(resp.content)
 
     all_rows = _parse_csv_rows(text)
+    # Retain the same parsed AFM CSV for the plugin's complete historical
+    # import. We never re-fetch the AFM source for shortcode synchronisation.
+    global _FULL_SHORT_HISTORY
+    _FULL_SHORT_HISTORY = list(all_rows)
     latest_with_prev = _attach_previous(all_rows)
     return latest_with_prev
 
@@ -338,3 +347,29 @@ def fetch_items() -> List[Dict]:
 
 def fetch_afm_table() -> List[Dict]:
     return fetch_items()
+
+
+def fetch_full_history_for_plugin() -> List[Dict]:
+    """Return the complete validated, allowlisted AFM history from this run.
+
+    Use this only after fetch_afm_table() has loaded the one AFM CSV.
+    Older filings are retained for graph reconstruction and exact day-by-day
+    movements; the current alert publisher continues receiving latest only.
+    """
+    if not _FULL_SHORT_HISTORY:
+        return []
+    groups: DefaultDict[Tuple[str, str], List[ShortPosition]] = defaultdict(list)
+    for row in _FULL_SHORT_HISTORY:
+        groups[(row.issuer_isin or row.issuer, row.short_seller)].append(row)
+    expanded: List[Dict] = []
+    for group in groups.values():
+        previous = None
+        for entry in sorted(group, key=lambda x: (x.position_date_iso, x.unique_id)):
+            result = entry.to_dict()
+            # Copy the preceding disclosure for the daily mutation and chart.
+            if previous is not None:
+                result["prev_net_short_pct_num"] = previous.net_short_pct_num
+                result["prev_position_date_iso"] = previous.position_date_iso
+            expanded.append(result)
+            previous = entry
+    return expanded
