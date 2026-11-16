@@ -1,0 +1,21 @@
+name: Pennywatch shortcode bridge CI
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m compileall -q afm_scraper.py main.py shortcode_sync.py pennywatch_universe.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
