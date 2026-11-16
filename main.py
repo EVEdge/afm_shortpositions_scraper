@@ -55,10 +55,10 @@ def process_new_entries():
             stock_resolver=lambda _issuer, _isin: None,
             holder_resolver=lambda _holder: None,
         )
-        logging.info(
-            "PW AFM historical plugin sync successful: source=%d transmitted=%d",
-            len(history),
-            imported,
+        print(
+            "PW AFM plugin sync OK: source_rows=%d transmitted=%d endpoint=pw-afm/v1/import"
+            % (len(history), imported),
+            flush=True,
         )
 
 if __name__ == "__main__":
